@@ -28,8 +28,7 @@ autostart_processes = []
 def github_api(method, path, data=None):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/{path}"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    if method == "GET":
-        return requests.get(url, headers=headers)
+    if method == "GET": return requests.get(url, headers=headers)
     return requests.put(url, headers=headers, json=data)
 
 def ensure_repo_exists():
@@ -40,27 +39,22 @@ def ensure_repo_exists():
 
 def backup_workspace():
     while True:
-        time.sleep(30) # Backup every 30 seconds to be safe
+        time.sleep(30)
         if not GITHUB_TOKEN.startswith("ghp_"): continue
         try:
             res = github_api("GET", "contents/")
             repo_files = {}
             if res.status_code == 200:
-                for item in res.json():
-                    repo_files[item["name"]] = item["sha"]
+                for item in res.json(): repo_files[item["name"]] = item["sha"]
 
             for filename in os.listdir(WORKSPACE_PATH):
                 filepath = os.path.join(WORKSPACE_PATH, filename)
-                # Now we backup EVERYTHING except the log file and python cache
-                if not os.path.isfile(filepath) or filename.startswith('.') or filename == "bot_logs.txt" or filename.endswith(".pyc"): 
-                    continue
+                if not os.path.isfile(filepath) or filename.startswith('.') or filename == "bot_logs.txt" or filename.endswith(".pyc"): continue
                 
-                with open(filepath, "rb") as f:
-                    content = base64.b64encode(f.read()).decode()
+                with open(filepath, "rb") as f: content = base64.b64encode(f.read()).decode()
                 
                 data = {"message": f"Auto-backup {filename}", "content": content}
-                if filename in repo_files:
-                    data["sha"] = repo_files[filename]
+                if filename in repo_files: data["sha"] = repo_files[filename]
                 github_api("PUT", f"contents/{filename}", data)
         except: pass
 
@@ -72,8 +66,7 @@ def restore_workspace():
             for item in res.json():
                 if item["type"] == "file":
                     dl = requests.get(item["download_url"])
-                    with open(os.path.join(WORKSPACE_PATH, item["name"]), "wb") as f:
-                        f.write(dl.content)
+                    with open(os.path.join(WORKSPACE_PATH, item["name"]), "wb") as f: f.write(dl.content)
     except: pass
 
 # ─────────────────── AUTO HOST SYSTEM ─────────────────────────
@@ -82,24 +75,19 @@ def start_autostart_bots():
     if not os.path.exists(AUTOSTART_FILE):
         with open(AUTOSTART_FILE, "w") as f: json.dump([], f)
         return
-        
     try:
-        with open(AUTOSTART_FILE, "r") as f:
-            cmds = json.load(f)
-            
+        with open(AUTOSTART_FILE, "r") as f: cmds = json.load(f)
         for cmd in cmds:
             with open(LOG_FILE, "a") as log:
                 log.write(f"\n\n--- [SYSTEM BOOT] Starting: {cmd} ---\n")
                 p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
                 autostart_processes.append({"cmd": cmd, "pid": p.pid})
-            print(f"[+] Auto-started: {cmd}")
-    except Exception as e:
-        print(f"Auto-start error: {e}")
+    except: pass
 
 ensure_repo_exists()
 threading.Thread(target=backup_workspace, daemon=True).start()
 threading.Thread(target=restore_workspace, daemon=True).start()
-threading.Timer(10.0, start_autostart_bots).start() # Wait 10 seconds for files to download before hosting
+threading.Timer(10.0, start_autostart_bots).start()
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
 def cleanup_watchdog():
@@ -131,90 +119,74 @@ TERMINAL_HTML = """
     <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
     <style>
         body { font-family: 'Space Grotesk', sans-serif; background: #000; color: white; overflow: hidden; }
-        .stars { position: absolute; width: 100%; height: 100%; background: url('https://www.transparenttextures.com/patterns/stardust.png'); opacity: 0.2; z-index: 0; pointer-events: none; }
-        .glass { background: rgba(10, 10, 15, 0.7); backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.1); }
-        #terminal-container { height: calc(100vh - 200px); width: 100%; padding: 10px; border-radius: 0 0 16px 16px; }
+        #terminal-container { height: calc(100vh - 120px); width: 100%; padding: 10px; background: #000; border-radius: 8px; }
         .xterm-viewport::-webkit-scrollbar { width: 6px; }
         .xterm-viewport::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+        
+        /* Force keyboard to stay open */
+        .xterm-helper-textarea { z-index: 9999 !important; }
     </style>
 </head>
-<body class="h-screen flex flex-col relative">
-    <div class="stars"></div>
+<body class="h-screen flex flex-col p-2 relative bg-gray-900">
     
-    <div class="glass px-4 md:px-6 py-4 rounded-b-3xl z-10 flex flex-wrap gap-2 justify-between items-center shadow-2xl border-t-0">
-        <div class="flex items-center gap-3">
+    <!-- Top Bar -->
+    <div class="bg-gray-800 border border-gray-700 px-4 py-3 rounded-lg flex flex-wrap gap-2 justify-between items-center shadow-lg mb-2">
+        <div class="flex items-center gap-2">
             <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
-            <h1 class="text-lg md:text-xl font-bold tracking-wider text-indigo-300">REXI CLOUD</h1>
+            <h1 class="text-lg font-bold text-indigo-400">REXI CLOUD</h1>
         </div>
         <div class="flex flex-wrap gap-2">
-            <button onclick="document.getElementById('fileInput').click()" class="bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/50 text-indigo-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold flex items-center gap-1">
-                📁 Upload
-            </button>
+            <button onclick="document.getElementById('fileInput').click()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded text-xs font-bold">📁 Upload</button>
             <input type="file" id="fileInput" class="hidden" onchange="uploadFile()">
             
-            <button onclick="openFileManager()" class="bg-purple-600/20 hover:bg-purple-600 border border-purple-500/50 text-purple-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold flex items-center gap-1">
-                📝 Files
-            </button>
-
-            <button onclick="openAutoHost()" class="bg-green-600/20 hover:bg-green-600 border border-green-500/50 text-green-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold flex items-center gap-1">
-                🚀 Auto-Host
-            </button>
-            
-            <button onclick="sendCtrlC()" class="bg-yellow-600/20 hover:bg-yellow-600 border border-yellow-500/50 text-yellow-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold flex items-center gap-1">
-                🛑 Ctrl+C
-            </button>
+            <button onclick="openModal('fileManagerModal')" class="bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded text-xs font-bold">📝 Files</button>
+            <button onclick="openModal('autoHostModal')" class="bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded text-xs font-bold">🚀 Auto-Host</button>
+            <button onclick="sendCtrlC()" class="bg-yellow-600 hover:bg-yellow-500 text-black px-3 py-1.5 rounded text-xs font-bold">🛑 Ctrl+C</button>
         </div>
     </div>
 
-    <div class="flex-1 p-4 z-10">
-        <div class="glass rounded-2xl h-full flex flex-col overflow-hidden shadow-[0_0_50px_rgba(79,70,229,0.1)] border-indigo-500/20">
-            <div class="bg-gray-900/80 px-4 py-2 flex items-center justify-between border-b border-gray-800">
-                <span class="text-xs text-indigo-400 font-mono tracking-widest">MASTER TERMINAL</span>
-                <span class="text-xs text-gray-500 font-mono">Status: <span class="text-green-400" id="statusText">Connected</span></span>
-            </div>
-            <div id="terminal-container" onclick="focusTerm()"></div>
-        </div>
-    </div>
+    <!-- Terminal -->
+    <div id="terminal-container" onclick="term.focus()"></div>
 
-    <!-- File Manager Modal -->
-    <div id="fileManagerModal" class="fixed inset-0 bg-black/80 z-50 flex items-center justify-center hidden backdrop-blur-sm">
-        <div class="glass w-11/12 md:w-3/4 max-w-2xl h-3/4 rounded-2xl flex flex-col overflow-hidden border-indigo-500/30">
-            <div class="px-6 py-4 border-b border-gray-700 flex justify-between items-center">
-                <h2 class="text-xl font-bold text-purple-400">📝 File Manager</h2>
-                <button onclick="closeFileManager()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+    <!-- File Manager Modal (Solid Background) -->
+    <div id="fileManagerModal" class="fixed inset-0 bg-black z-50 flex items-center justify-center hidden p-4">
+        <div class="bg-gray-800 border border-gray-600 w-full max-w-3xl h-[80vh] rounded-xl flex flex-col overflow-hidden shadow-2xl relative">
+            <button onclick="closeModal('fileManagerModal')" class="absolute top-3 right-3 text-white bg-red-600 hover:bg-red-500 w-8 h-8 rounded-full font-bold flex items-center justify-center z-50">✖</button>
+            <div class="px-6 py-4 border-b border-gray-600">
+                <h2 class="text-lg font-bold text-purple-400">📝 File Manager</h2>
             </div>
             <div class="flex-1 flex overflow-hidden">
-                <div id="fileListDiv" class="w-1/3 border-r border-gray-700 overflow-y-auto p-2"></div>
-                <div class="w-2/3 flex flex-col">
-                    <div id="editorHeader" class="p-2 border-b border-gray-700 text-sm text-gray-400 font-mono hidden">Select a file to edit</div>
-                    <textarea id="codeEditor" class="flex-1 bg-transparent text-white font-mono text-sm p-4 focus:outline-none resize-none hidden"></textarea>
-                    <div id="editorFooter" class="p-3 border-t border-gray-700 flex justify-end gap-2 hidden">
-                        <button onclick="saveFile()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-bold text-sm">Save File</button>
+                <div id="fileListDiv" class="w-1/3 border-r border-gray-600 overflow-y-auto p-2 bg-gray-900"></div>
+                <div class="w-2/3 flex flex-col bg-gray-800">
+                    <div id="editorHeader" class="p-2 border-b border-gray-600 text-sm text-gray-400 font-mono hidden">Select a file</div>
+                    <textarea id="codeEditor" class="flex-1 bg-gray-900 text-white font-mono text-sm p-4 focus:outline-none resize-none hidden" spellcheck="false"></textarea>
+                    <div id="editorFooter" class="p-3 border-t border-gray-600 flex justify-end hidden">
+                        <button onclick="saveFile()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded font-bold text-sm">Save File</button>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Auto-Host Modal -->
-    <div id="autoHostModal" class="fixed inset-0 bg-black/80 z-50 flex items-center justify-center hidden backdrop-blur-sm">
-        <div class="glass w-11/12 md:w-3/4 max-w-2xl h-3/4 rounded-2xl flex flex-col overflow-hidden border-green-500/30">
-            <div class="px-6 py-4 border-b border-gray-700 flex justify-between items-center">
-                <h2 class="text-xl font-bold text-green-400">🚀 Auto-Host Engine</h2>
-                <button onclick="closeAutoHost()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+    <!-- Auto-Host Modal (Solid Background) -->
+    <div id="autoHostModal" class="fixed inset-0 bg-black z-50 flex items-center justify-center hidden p-4">
+        <div class="bg-gray-800 border border-gray-600 w-full max-w-3xl h-[80vh] rounded-xl flex flex-col overflow-hidden shadow-2xl relative">
+            <button onclick="closeModal('autoHostModal')" class="absolute top-3 right-3 text-white bg-red-600 hover:bg-red-500 w-8 h-8 rounded-full font-bold flex items-center justify-center z-50">✖</button>
+            <div class="px-6 py-4 border-b border-gray-600">
+                <h2 class="text-lg font-bold text-green-400">🚀 Auto-Host Engine</h2>
             </div>
-            <div class="p-4 flex gap-2 border-b border-gray-700">
-                <input type="text" id="hostCmd" placeholder="e.g. python tg_bot.py" class="flex-1 bg-gray-900 border border-gray-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-green-500">
-                <button onclick="addAutoHost()" class="bg-green-600 hover:bg-green-500 text-white font-bold px-6 rounded-lg">Add</button>
+            <div class="p-4 flex gap-2 border-b border-gray-600 bg-gray-900">
+                <input type="text" id="hostCmd" placeholder="e.g. python tg_bot.py" class="flex-1 bg-gray-800 border border-gray-600 rounded p-2 text-white text-sm focus:outline-none focus:border-green-500">
+                <button onclick="addAutoHost()" class="bg-green-600 hover:bg-green-500 text-white font-bold px-6 rounded text-sm">Add</button>
             </div>
             <div class="flex-1 flex overflow-hidden">
-                <div class="w-1/2 border-r border-gray-700 overflow-y-auto p-4">
+                <div class="w-1/2 border-r border-gray-600 overflow-y-auto p-4 bg-gray-800">
                     <h3 class="text-sm font-bold text-gray-400 mb-2">Active Commands</h3>
                     <div id="autoHostList" class="space-y-2"></div>
                 </div>
-                <div class="w-1/2 p-4 flex flex-col">
+                <div class="w-1/2 p-4 flex flex-col bg-black">
                     <h3 class="text-sm font-bold text-gray-400 mb-2">Live Logs</h3>
-                    <pre id="hostLogs" class="flex-1 bg-black text-green-400 font-mono text-xs overflow-y-auto whitespace-pre-wrap rounded p-2"></pre>
+                    <pre id="hostLogs" class="flex-1 text-green-400 font-mono text-xs overflow-y-auto whitespace-pre-wrap"></pre>
                 </div>
             </div>
         </div>
@@ -223,7 +195,7 @@ TERMINAL_HTML = """
     <script>
         const term = new Terminal({
             cursorBlink: true,
-            theme: { background: 'transparent', foreground: '#e2e8f0', cursor: '#6366f1', selectionBackground: '#4f46e5' },
+            theme: { background: '#000000', foreground: '#ffffff', cursor: '#6366f1' },
             fontFamily: "'JetBrains Mono', monospace",
             fontSize: 14
         });
@@ -231,25 +203,29 @@ TERMINAL_HTML = """
         term.loadAddon(fitAddon);
         term.open(document.getElementById('terminal-container'));
         fitAddon.fit();
-        
-        function focusTerm() { term.focus(); }
-        setTimeout(focusTerm, 500);
-        document.getElementById('terminal-container').addEventListener('touchstart', focusTerm, {passive: true});
-        document.getElementById('terminal-container').addEventListener('click', focusTerm, {passive: true});
+
+        // Aggressive mobile focus fix
+        const terminalDiv = document.getElementById('terminal-container');
+        function forceFocus(e) {
+            if(e) e.preventDefault();
+            term.focus();
+        }
+        terminalDiv.addEventListener('touchstart', forceFocus, {passive: false});
+        terminalDiv.addEventListener('click', forceFocus, {passive: false});
+        setTimeout(forceFocus, 500);
+        setTimeout(forceFocus, 2000);
 
         const socket = io();
 
         socket.on('connect', () => {
-            document.getElementById('statusText').innerText = "Connected";
-            document.getElementById('statusText').className = "text-green-400";
             socket.emit('join_master');
             socket.emit('start_pty');
             setInterval(() => { socket.emit('heartbeat'); }, 10000);
         });
 
-        socket.on('disconnect', () => {
-            document.getElementById('statusText').innerText = "Disconnected";
-            document.getElementById('statusText').className = "text-red-400";
+        // If terminal died on backend, restart it automatically
+        socket.on('restart_pty', () => {
+            socket.emit('start_pty');
         });
 
         socket.on('pty_output', (data) => { term.write(data); });
@@ -260,48 +236,47 @@ TERMINAL_HTML = """
 
         function sendCtrlC() { socket.emit('pty_input', '\\x03'); term.focus(); }
 
-        function uploadFile() {
-            const fileInput = document.getElementById('fileInput');
-            const file = fileInput.files[0];
-            if (!file) return;
-            term.write(`\\r\\n\\x1b[1;33m[~] Uploading ${file.name}...\\x1b[0m\\r\\n`);
-            const formData = new FormData();
-            formData.append('file', file);
-            fetch('/upload', { method: 'POST', body: formData })
-                .then(r => r.json())
-                .then(res => {
-                    if(res.success) socket.emit('show_upload_success', file.name);
-                    else socket.emit('show_upload_error', res.error);
-                }).catch(e => socket.emit('show_upload_error', e.message));
-            fileInput.value = ''; 
+        // ── MODAL CONTROLS ──
+        function openModal(id) {
+            document.getElementById(id).classList.remove('hidden');
+            if(id === 'fileManagerModal') loadFiles();
+            if(id === 'autoHostModal') loadAutoHost();
+        }
+        function closeModal(id) {
+            document.getElementById(id).classList.add('hidden');
         }
 
         // ── FILE MANAGER ──
         let currentFile = null;
-        function openFileManager() { document.getElementById('fileManagerModal').classList.remove('hidden'); loadFiles(); }
-        function closeFileManager() { document.getElementById('fileManagerModal').classList.add('hidden'); }
-
         function loadFiles() {
+            const listDiv = document.getElementById('fileListDiv');
+            listDiv.innerHTML = '<div class="text-gray-400 text-xs text-center mt-4">Loading...</div>';
+            
             fetch('/api/files').then(r => r.json()).then(files => {
-                const listDiv = document.getElementById('fileListDiv');
                 listDiv.innerHTML = '';
-                if (files.length === 0) { listDiv.innerHTML = '<div class="text-gray-500 text-xs text-center mt-4">No files.</div>'; return; }
+                if (files.length === 0) { listDiv.innerHTML = '<div class="text-gray-400 text-xs text-center mt-4">No files.</div>'; return; }
                 files.forEach(f => {
                     listDiv.innerHTML += `
-                        <div class="flex justify-between items-center p-2 hover:bg-gray-800 rounded cursor-pointer group" onclick="loadFile('${f}')">
+                        <div class="flex justify-between items-center p-2 hover:bg-gray-700 rounded cursor-pointer group" onclick="loadFile('${f}')">
                             <span class="text-sm font-mono text-indigo-300">${f}</span>
-                            <button onclick="event.stopPropagation(); deleteFile('${f}')" class="text-red-500 opacity-0 group-hover:opacity-100 p-1">✖</button>
+                            <button onclick="event.stopPropagation(); deleteFile('${f}')" class="text-red-500 hover:text-red-400 px-2">✖</button>
                         </div>`;
                 });
+            }).catch(e => {
+                listDiv.innerHTML = '<div class="text-red-500 text-xs text-center mt-4">Error loading files.</div>';
             });
         }
 
         function loadFile(filename) {
             currentFile = filename;
+            document.getElementById('editorHeader').innerText = "Loading " + filename + "...";
+            document.getElementById('editorHeader').classList.remove('hidden');
+            document.getElementById('codeEditor').classList.add('hidden');
+            document.getElementById('editorFooter').classList.add('hidden');
+
             fetch('/api/read?file=' + encodeURIComponent(filename)).then(r => r.json()).then(res => {
                 if (res.success) {
                     document.getElementById('editorHeader').innerText = "Editing: " + filename;
-                    document.getElementById('editorHeader').classList.remove('hidden');
                     const editor = document.getElementById('codeEditor');
                     editor.value = res.content;
                     editor.classList.remove('hidden');
@@ -321,22 +296,43 @@ TERMINAL_HTML = """
             if (!confirm("Delete " + filename + "?")) return;
             fetch('/api/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({file: filename}) })
             .then(r => r.json()).then(res => {
-                if (res.success) { loadFiles(); if (currentFile === filename) { document.getElementById('editorHeader').classList.add('hidden'); document.getElementById('codeEditor').classList.add('hidden'); document.getElementById('editorFooter').classList.add('hidden'); } }
+                if (res.success) { 
+                    loadFiles(); 
+                    if (currentFile === filename) { 
+                        document.getElementById('editorHeader').classList.add('hidden'); 
+                        document.getElementById('codeEditor').classList.add('hidden'); 
+                        document.getElementById('editorFooter').classList.add('hidden'); 
+                    } 
+                }
             });
         }
 
-        // ── AUTO-HOST ──
-        function openAutoHost() { document.getElementById('autoHostModal').classList.remove('hidden'); loadAutoHost(); }
-        function closeAutoHost() { document.getElementById('autoHostModal').classList.add('hidden'); }
+        function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if (!file) return;
+            term.write(`\\r\\n\\x1b[1;33m[~] Uploading ${file.name}...\\x1b[0m\\r\\n`);
+            const formData = new FormData();
+            formData.append('file', file);
+            fetch('/upload', { method: 'POST', body: formData })
+                .then(r => r.json())
+                .then(res => {
+                    if(res.success) socket.emit('show_upload_success', file.name);
+                    else socket.emit('show_upload_error', res.error);
+                });
+            fileInput.value = ''; 
+            loadFiles(); // Refresh list in case modal is open
+        }
 
+        // ── AUTO-HOST ──
         function loadAutoHost() {
             fetch('/api/autohost').then(r => r.json()).then(data => {
                 const list = document.getElementById('autoHostList');
                 list.innerHTML = '';
-                if (data.length === 0) { list.innerHTML = '<div class="text-gray-500 text-xs">No auto-host commands active.</div>'; return; }
+                if (data.length === 0) { list.innerHTML = '<div class="text-gray-500 text-xs">No commands.</div>'; return; }
                 data.forEach(c => {
                     list.innerHTML += `
-                        <div class="flex justify-between items-center bg-gray-800 p-2 rounded text-sm border border-gray-700">
+                        <div class="flex justify-between items-center bg-gray-900 p-2 rounded text-sm border border-gray-700">
                             <span class="text-green-400 font-mono text-xs">${c}</span>
                             <button onclick="removeAutoHost('${c}')" class="text-red-500 hover:text-red-400 font-bold px-2">✖</button>
                         </div>`;
@@ -390,7 +386,6 @@ def upload():
 
 @app.route('/api/files')
 def api_files():
-    # Hide the log and json to keep the UI clean
     files = [f for f in os.listdir(WORKSPACE_PATH) if os.path.isfile(os.path.join(WORKSPACE_PATH, f)) and not f.startswith('.') and f not in ('bot_logs.txt', 'autostart.json')]
     return jsonify(files)
 
@@ -512,7 +507,12 @@ def on_pty_input(data):
 
 @socketio.on('heartbeat')
 def on_heartbeat():
-    if active_terminal: active_terminal["last_ping"] = time.time()
+    global active_terminal
+    if active_terminal:
+        active_terminal["last_ping"] = time.time()
+    else:
+        # If the terminal died on the server, tell the client to restart it
+        emit('restart_pty', room=request.sid)
 
 @socketio.on('show_upload_success')
 def show_upload_success(filename): emit('upload_success', filename, room="master_terminal")
