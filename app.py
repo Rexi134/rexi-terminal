@@ -1,87 +1,124 @@
 #!/usr/bin/env python3
-"""
-REXI'S CLOUD TERMINAL & HOSTING PANEL - ULTIMATE EDITION
-"""
 import eventlet
 eventlet.monkey_patch()
 
-import os, sys, time, uuid, shutil, pty, select, signal, tempfile, threading
-from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
-from flask_socketio import SocketIO, emit, join_room
+import os, sys, time, shutil, pty, select, signal, tempfile, threading, requests, base64, subprocess, json
+from flask import Flask, render_template_string, request, jsonify
+from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
-app.secret_key = "REXI_SUPREME_SECRET_99"
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
-
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=60)
 
-ACCESS_KEY = "Rexi_Terminal_x60"
+# ─────────────────────────── CONFIG ───────────────────────────
+GITHUB_TOKEN = "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" 
+GITHUB_USER = "Rexi134"
+REPO_NAME = "rexi-backup"
+GITHUB_REPO = f"{GITHUB_USER}/{REPO_NAME}"
 
-workspaces = {}         
-workspace_last_seen = {} 
-active_terminals = {}   
+WORKSPACE_PATH = tempfile.mkdtemp(prefix="rexi_terminal_")
+AUTOSTART_FILE = os.path.join(WORKSPACE_PATH, "autostart.json")
+LOG_FILE = os.path.join(WORKSPACE_PATH, "bot_logs.txt")
+
+active_terminal = None
+workspace_last_seen = time.time()
+autostart_processes = []
+
+# ─────────────────── GITHUB BACKUP SYSTEM ─────────────────────
+def github_api(method, path, data=None):
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/{path}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    if method == "GET":
+        return requests.get(url, headers=headers)
+    return requests.put(url, headers=headers, json=data)
+
+def ensure_repo_exists():
+    url = f"https://api.github.com/repos/{GITHUB_REPO}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    if requests.get(url, headers=headers).status_code == 404:
+        print(f"[+] Repo {GITHUB_REPO} not found. Creating it now...")
+        requests.post("https://api.github.com/user/repos", headers=headers, json={"name": REPO_NAME, "private": True})
+
+def backup_workspace():
+    while True:
+        time.sleep(60)
+        if not GITHUB_TOKEN.startswith("ghp_"): continue
+        try:
+            res = github_api("GET", "contents/")
+            repo_files = {}
+            if res.status_code == 200:
+                for item in res.json():
+                    repo_files[item["name"]] = item["sha"]
+
+            for filename in os.listdir(WORKSPACE_PATH):
+                filepath = os.path.join(WORKSPACE_PATH, filename)
+                if not os.path.isfile(filepath) or filename.startswith('.') or filename == "bot_logs.txt": continue
+                
+                with open(filepath, "rb") as f:
+                    content = base64.b64encode(f.read()).decode()
+                
+                data = {"message": f"Auto-backup {filename}", "content": content}
+                if filename in repo_files:
+                    data["sha"] = repo_files[filename]
+                github_api("PUT", f"contents/{filename}", data)
+        except: pass
+
+def restore_workspace():
+    if not GITHUB_TOKEN.startswith("ghp_"): return
+    try:
+        res = github_api("GET", "contents/")
+        if res.status_code == 200:
+            for item in res.json():
+                if item["type"] == "file":
+                    dl = requests.get(item["download_url"])
+                    with open(os.path.join(WORKSPACE_PATH, item["name"]), "wb") as f:
+                        f.write(dl.content)
+            print("[+] Files restored from GitHub!")
+    except: pass
+
+# ─────────────────── AUTO HOST SYSTEM ─────────────────────────
+def start_autostart_bots():
+    global autostart_processes
+    if not os.path.exists(AUTOSTART_FILE):
+        with open(AUTOSTART_FILE, "w") as f: json.dump([], f)
+        return
+        
+    try:
+        with open(AUTOSTART_FILE, "r") as f:
+            cmds = json.load(f)
+            
+        for cmd in cmds:
+            # Start the process and redirect output to LOG_FILE
+            with open(LOG_FILE, "a") as log:
+                log.write(f"\n\n--- [SYSTEM BOOT] Starting: {cmd} ---\n")
+                p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
+                autostart_processes.append({"cmd": cmd, "pid": p.pid})
+            print(f"[+] Auto-started: {cmd}")
+    except Exception as e:
+        print(f"Auto-start error: {e}")
+
+ensure_repo_exists()
+threading.Thread(target=backup_workspace, daemon=True).start()
+threading.Thread(target=restore_workspace, daemon=True).start()
+
+# Start autostart bots after files are restored
+threading.Timer(5.0, start_autostart_bots).start()
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
 def cleanup_watchdog():
+    global active_terminal
     while True:
         time.sleep(10)
-        now = time.time()
-        
-        # 1. Kill stalled terminals (3600s = 1 hour grace period)
-        for ws_id in list(active_terminals.keys()):
-            sess = active_terminals[ws_id]
-            if now - sess["last_ping"] > 3600:
-                try: os.kill(sess["pid"], signal.SIGKILL)
-                except: pass
-                try: os.close(sess["fd"])
-                except: pass
-                del active_terminals[ws_id]
-
-        # 2. Delete files for closed workspaces (3600s = 1 hour grace period)
-        for ws_id in list(workspaces.keys()):
-            if now - workspace_last_seen.get(ws_id, 0) > 3600:
-                shutil.rmtree(workspaces[ws_id], ignore_errors=True)
-                del workspaces[ws_id]
-                if ws_id in workspace_last_seen: del workspace_last_seen[ws_id]
+        if active_terminal and time.time() - active_terminal["last_ping"] > 7200:
+            try: os.kill(active_terminal["pid"], signal.SIGKILL)
+            except: pass
+            try: os.close(active_terminal["fd"])
+            except: pass
+            active_terminal = None
 
 threading.Thread(target=cleanup_watchdog, daemon=True).start()
 
-# ─────────────────────── HTML TEMPLATES ──────────────────────
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>REXI CLOUD | Access</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Space Grotesk', sans-serif; background: #000; color: white; overflow: hidden; }
-        .stars { position: absolute; width: 100%; height: 100%; background: url('https://www.transparenttextures.com/patterns/stardust.png'); opacity: 0.3; z-index: -1; }
-        .glow { box-shadow: 0 0 30px rgba(99, 102, 241, 0.4); }
-    </style>
-</head>
-<body class="flex items-center justify-center h-screen relative">
-    <div class="stars"></div>
-    <div class="bg-gray-900/60 backdrop-blur-xl border border-gray-700/50 p-10 rounded-3xl shadow-2xl w-96 relative z-10">
-        <div class="text-center mb-8">
-            <div class="w-20 h-20 mx-auto bg-indigo-500/20 rounded-full flex items-center justify-center border border-indigo-500/50 mb-4 glow">
-                <span class="text-4xl">🚀</span>
-            </div>
-            <h1 class="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">REXI TERMINAL</h1>
-            <p class="text-xs text-gray-400 mt-2">Secure Cloud Environment</p>
-        </div>
-        <form method="POST">
-            <input type="password" name="key" placeholder="Enter Access Key" class="w-full bg-gray-950/50 border border-gray-600 rounded-xl p-4 text-white mb-6 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 transition-all text-center tracking-widest font-mono" required>
-            {% if error %}<p class="text-red-400 text-sm text-center mb-4">{{ error }}</p>{% endif %}
-            <button type="submit" class="w-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold py-4 rounded-xl shadow-lg transition-all active:scale-95">INITIALIZE</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
+# ─────────────────────── HTML TEMPLATE ───────────────────────
 TERMINAL_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -121,19 +158,21 @@ TERMINAL_HTML = """
             <button onclick="openFileManager()" class="bg-purple-600/20 hover:bg-purple-600 border border-purple-500/50 text-purple-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold flex items-center gap-1">
                 📝 Files
             </button>
+
+            <button onclick="openAutoHost()" class="bg-green-600/20 hover:bg-green-600 border border-green-500/50 text-green-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold flex items-center gap-1">
+                🚀 Auto-Host
+            </button>
             
             <button onclick="sendCtrlC()" class="bg-yellow-600/20 hover:bg-yellow-600 border border-yellow-500/50 text-yellow-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold flex items-center gap-1">
                 🛑 Ctrl+C
             </button>
-            
-            <a href="/logout" class="bg-red-500/20 hover:bg-red-500 border border-red-500/50 text-red-300 hover:text-white px-3 py-2 rounded-lg transition-all text-xs font-bold">Terminate</a>
         </div>
     </div>
 
     <div class="flex-1 p-4 z-10">
         <div class="glass rounded-2xl h-full flex flex-col overflow-hidden shadow-[0_0_50px_rgba(79,70,229,0.1)] border-indigo-500/20">
             <div class="bg-gray-900/80 px-4 py-2 flex items-center justify-between border-b border-gray-800">
-                <span class="text-xs text-indigo-400 font-mono tracking-widest">TERMINAL // WORKSPACE</span>
+                <span class="text-xs text-indigo-400 font-mono tracking-widest">MASTER TERMINAL</span>
                 <span class="text-xs text-gray-500 font-mono">Status: <span class="text-green-400" id="statusText">Connected</span></span>
             </div>
             <div id="terminal-container" onclick="term.focus()"></div>
@@ -160,9 +199,31 @@ TERMINAL_HTML = """
         </div>
     </div>
 
+    <!-- Auto-Host Modal -->
+    <div id="autoHostModal" class="fixed inset-0 bg-black/80 z-50 flex items-center justify-center hidden backdrop-blur-sm">
+        <div class="glass w-11/12 md:w-3/4 max-w-2xl h-3/4 rounded-2xl flex flex-col overflow-hidden border-green-500/30">
+            <div class="px-6 py-4 border-b border-gray-700 flex justify-between items-center">
+                <h2 class="text-xl font-bold text-green-400">🚀 Auto-Host Engine</h2>
+                <button onclick="closeAutoHost()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            <div class="p-4 flex gap-2 border-b border-gray-700">
+                <input type="text" id="hostCmd" placeholder="e.g. python are.py" class="flex-1 bg-gray-900 border border-gray-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-green-500">
+                <button onclick="addAutoHost()" class="bg-green-600 hover:bg-green-500 text-white font-bold px-6 rounded-lg">Add</button>
+            </div>
+            <div class="flex-1 flex overflow-hidden">
+                <div class="w-1/2 border-r border-gray-700 overflow-y-auto p-4">
+                    <h3 class="text-sm font-bold text-gray-400 mb-2">Active Commands</h3>
+                    <div id="autoHostList" class="space-y-2"></div>
+                </div>
+                <div class="w-1/2 p-4 flex flex-col">
+                    <h3 class="text-sm font-bold text-gray-400 mb-2">Live Logs</h3>
+                    <pre id="hostLogs" class="flex-1 bg-black text-green-400 font-mono text-xs overflow-y-auto whitespace-pre-wrap rounded p-2"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
-        const ws_id = "{{ session.get('ws_id', '') }}";
-        
         const term = new Terminal({
             cursorBlink: true,
             theme: { background: 'transparent', foreground: '#e2e8f0', cursor: '#6366f1', selectionBackground: '#4f46e5' },
@@ -174,21 +235,15 @@ TERMINAL_HTML = """
         term.open(document.getElementById('terminal-container'));
         fitAddon.fit();
 
-        // Force keyboard on mobile
-        document.getElementById('terminal-container').addEventListener('touchstart', () => {
-            term.focus();
-        }, {passive: true});
+        document.getElementById('terminal-container').addEventListener('touchstart', () => { term.focus(); }, {passive: true});
 
         const socket = io();
 
         socket.on('connect', () => {
             document.getElementById('statusText').innerText = "Connected";
             document.getElementById('statusText').className = "text-green-400";
-            socket.emit('start_pty', { ws_id: ws_id });
-            
-            setInterval(() => { 
-                socket.emit('heartbeat', { ws_id: ws_id }); 
-            }, 10000);
+            socket.emit('start_pty');
+            setInterval(() => { socket.emit('heartbeat'); }, 10000);
         });
 
         socket.on('disconnect', () => {
@@ -200,13 +255,9 @@ TERMINAL_HTML = """
         socket.on('upload_success', (filename) => { term.write(`\\r\\n\\x1b[1;32m[+] File ${filename} uploaded!\\x1b[0m\\r\\n`); });
         socket.on('upload_error', (err) => { term.write(`\\r\\n\\x1b[1;31m[!] Upload failed: ${err}\\x1b[0m\\r\\n`); });
 
-        // Send keystrokes with ws_id to ensure it goes to the right terminal
-        term.onData((data) => { socket.emit('pty_input', { ws_id: ws_id, data: data }); });
+        term.onData((data) => { socket.emit('pty_input', data); });
 
-        function sendCtrlC() {
-            socket.emit('pty_input', { ws_id: ws_id, data: '\\x03' });
-            term.focus();
-        }
+        function sendCtrlC() { socket.emit('pty_input', '\\x03'); term.focus(); }
 
         function uploadFile() {
             const fileInput = document.getElementById('fileInput');
@@ -224,145 +275,127 @@ TERMINAL_HTML = """
             fileInput.value = ''; 
         }
 
+        // ── FILE MANAGER ──
         let currentFile = null;
-
-        function openFileManager() {
-            document.getElementById('fileManagerModal').classList.remove('hidden');
-            loadFiles();
-        }
-
-        function closeFileManager() {
-            document.getElementById('fileManagerModal').classList.add('hidden');
-        }
+        function openFileManager() { document.getElementById('fileManagerModal').classList.remove('hidden'); loadFiles(); }
+        function closeFileManager() { document.getElementById('fileManagerModal').classList.add('hidden'); }
 
         function loadFiles() {
             fetch('/api/files').then(r => r.json()).then(files => {
                 const listDiv = document.getElementById('fileListDiv');
                 listDiv.innerHTML = '';
-                if (files.length === 0) {
-                    listDiv.innerHTML = '<div class="text-gray-500 text-xs text-center mt-4">No files found.</div>';
-                    return;
-                }
+                if (files.length === 0) { listDiv.innerHTML = '<div class="text-gray-500 text-xs text-center mt-4">No files.</div>'; return; }
                 files.forEach(f => {
                     listDiv.innerHTML += `
                         <div class="flex justify-between items-center p-2 hover:bg-gray-800 rounded cursor-pointer group" onclick="loadFile('${f}')">
                             <span class="text-sm font-mono text-indigo-300">${f}</span>
-                            <button onclick="event.stopPropagation(); deleteFile('${f}')" class="text-red-500 opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-red-500/20 rounded">✖</button>
-                        </div>
-                    `;
+                            <button onclick="event.stopPropagation(); deleteFile('${f}')" class="text-red-500 opacity-0 group-hover:opacity-100 p-1">✖</button>
+                        </div>`;
                 });
             });
         }
 
         function loadFile(filename) {
             currentFile = filename;
-            fetch('/api/read?file=' + encodeURIComponent(filename))
-                .then(r => r.json())
-                .then(res => {
-                    if (res.success) {
-                        document.getElementById('editorHeader').innerText = "Editing: " + filename;
-                        document.getElementById('editorHeader').classList.remove('hidden');
-                        const editor = document.getElementById('codeEditor');
-                        editor.value = res.content;
-                        editor.classList.remove('hidden');
-                        document.getElementById('editorFooter').classList.remove('hidden');
-                    } else {
-                        alert("Cannot open file: " + res.error);
-                    }
-                });
+            fetch('/api/read?file=' + encodeURIComponent(filename)).then(r => r.json()).then(res => {
+                if (res.success) {
+                    document.getElementById('editorHeader').innerText = "Editing: " + filename;
+                    document.getElementById('editorHeader').classList.remove('hidden');
+                    const editor = document.getElementById('codeEditor');
+                    editor.value = res.content;
+                    editor.classList.remove('hidden');
+                    document.getElementById('editorFooter').classList.remove('hidden');
+                } else { alert("Error: " + res.error); }
+            });
         }
 
         function saveFile() {
             if (!currentFile) return;
             const content = document.getElementById('codeEditor').value;
-            fetch('/api/save', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({file: currentFile, content: content})
-            }).then(r => r.json()).then(res => {
-                if (res.success) alert("File saved successfully!");
-                else alert("Error saving: " + res.error);
-            });
+            fetch('/api/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({file: currentFile, content: content}) })
+            .then(r => r.json()).then(res => { if (res.success) alert("Saved!"); else alert("Error: " + res.error); });
         }
 
         function deleteFile(filename) {
             if (!confirm("Delete " + filename + "?")) return;
-            fetch('/api/delete', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({file: filename})
-            }).then(r => r.json()).then(res => {
-                if (res.success) {
-                    loadFiles();
-                    if (currentFile === filename) {
-                        document.getElementById('editorHeader').classList.add('hidden');
-                        document.getElementById('codeEditor').classList.add('hidden');
-                        document.getElementById('editorFooter').classList.add('hidden');
-                    }
-                }
+            fetch('/api/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({file: filename}) })
+            .then(r => r.json()).then(res => {
+                if (res.success) { loadFiles(); if (currentFile === filename) { document.getElementById('editorHeader').classList.add('hidden'); document.getElementById('codeEditor').classList.add('hidden'); document.getElementById('editorFooter').classList.add('hidden'); } }
             });
         }
+
+        // ── AUTO-HOST ──
+        function openAutoHost() { document.getElementById('autoHostModal').classList.remove('hidden'); loadAutoHost(); }
+        function closeAutoHost() { document.getElementById('autoHostModal').classList.add('hidden'); }
+
+        function loadAutoHost() {
+            fetch('/api/autohost').then(r => r.json()).then(data => {
+                const list = document.getElementById('autoHostList');
+                list.innerHTML = '';
+                if (data.length === 0) { list.innerHTML = '<div class="text-gray-500 text-xs">No auto-host commands active.</div>'; return; }
+                data.forEach(c => {
+                    list.innerHTML += `
+                        <div class="flex justify-between items-center bg-gray-800 p-2 rounded text-sm border border-gray-700">
+                            <span class="text-green-400 font-mono text-xs">${c}</span>
+                            <button onclick="removeAutoHost('${c}')" class="text-red-500 hover:text-red-400 font-bold px-2">✖</button>
+                        </div>`;
+                });
+            });
+            fetch('/api/logs').then(r => r.text()).then(logs => {
+                const logBox = document.getElementById('hostLogs');
+                logBox.innerText = logs;
+                logBox.scrollTop = logBox.scrollHeight;
+            });
+        }
+
+        function addAutoHost() {
+            const cmd = document.getElementById('hostCmd').value.trim();
+            if (!cmd) return;
+            fetch('/api/autohost', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cmd: cmd, action: 'add'}) })
+            .then(() => { document.getElementById('hostCmd').value = ''; loadAutoHost(); });
+        }
+
+        function removeAutoHost(cmd) {
+            fetch('/api/autohost', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cmd: cmd, action: 'remove'}) })
+            .then(() => loadAutoHost());
+        }
+
+        setInterval(() => {
+            if(!document.getElementById('autoHostModal').classList.contains('hidden')) {
+                fetch('/api/logs').then(r => r.text()).then(logs => {
+                    const logBox = document.getElementById('hostLogs');
+                    logBox.innerText = logs;
+                    logBox.scrollTop = logBox.scrollHeight;
+                });
+            }
+        }, 3000);
     </script>
 </body>
 </html>
 """
 
 # ─────────────────────── ROUTES ──────────────────────────────
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        if request.form.get('key') == ACCESS_KEY:
-            session['logged_in'] = True
-            if 'ws_id' not in session:
-                session['ws_id'] = str(uuid.uuid4())
-            return redirect(url_for('index'))
-        return render_template_string(LOGIN_HTML, error="Invalid Access Key")
-    return render_template_string(LOGIN_HTML)
-
-@app.route('/logout')
-def logout():
-    ws_id = session.get('ws_id')
-    if ws_id in workspaces:
-        shutil.rmtree(workspaces[ws_id], ignore_errors=True)
-        del workspaces[ws_id]
-    session.clear()
-    return redirect(url_for('login'))
-
 @app.route('/')
 def index():
-    if not session.get('logged_in'): return redirect(url_for('login'))
-    ws_id = session.get('ws_id')
-    if ws_id not in workspaces:
-        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
-    workspace_last_seen[ws_id] = time.time()
     return render_template_string(TERMINAL_HTML)
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    if not session.get('logged_in'): return jsonify({"success": False, "error": "Unauthorized"})
-    ws_id = session.get('ws_id')
-    if ws_id not in workspaces:
-        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
     file = request.files.get('file')
     if not file: return jsonify({"success": False, "error": "No file"})
-    filepath = os.path.join(workspaces[ws_id], file.filename)
+    filepath = os.path.join(WORKSPACE_PATH, file.filename)
     file.save(filepath)
     return jsonify({"success": True})
 
 @app.route('/api/files')
 def api_files():
-    if not session.get('logged_in'): return jsonify([])
-    ws_id = session.get('ws_id')
-    if ws_id not in workspaces: return jsonify([])
-    path = workspaces[ws_id]
-    files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+    files = [f for f in os.listdir(WORKSPACE_PATH) if os.path.isfile(os.path.join(WORKSPACE_PATH, f)) and not f.startswith('.') and f not in ('bot_logs.txt', 'autostart.json')]
     return jsonify(files)
 
 @app.route('/api/read')
 def api_read():
-    if not session.get('logged_in'): return jsonify({"success": False})
     filename = request.args.get('file')
-    path = os.path.join(workspaces[session.get('ws_id')], filename)
+    path = os.path.join(WORKSPACE_PATH, filename)
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return jsonify({"success": True, "content": f.read()})
@@ -371,9 +404,8 @@ def api_read():
 
 @app.route('/api/save', methods=['POST'])
 def api_save():
-    if not session.get('logged_in'): return jsonify({"success": False})
     data = request.json
-    path = os.path.join(workspaces[session.get('ws_id')], data['file'])
+    path = os.path.join(WORKSPACE_PATH, data['file'])
     try:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(data['content'])
@@ -383,88 +415,117 @@ def api_save():
 
 @app.route('/api/delete', methods=['POST'])
 def api_delete():
-    if not session.get('logged_in'): return jsonify({"success": False})
     filename = request.json.get('file')
-    path = os.path.join(workspaces[session.get('ws_id')], filename)
+    path = os.path.join(WORKSPACE_PATH, filename)
     try:
         os.remove(path)
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
+@app.route('/api/autohost', methods=['GET', 'POST'])
+def api_autohost():
+    global autostart_processes
+    if request.method == 'GET':
+        if not os.path.exists(AUTOSTART_FILE): return jsonify([])
+        with open(AUTOSTART_FILE, 'r') as f: return jsonify(json.load(f))
+        
+    data = request.json
+    action = data.get('action')
+    cmd = data.get('cmd')
+    
+    cmds = []
+    if os.path.exists(AUTOSTART_FILE):
+        with open(AUTOSTART_FILE, 'r') as f: cmds = json.load(f)
+        
+    if action == 'add' and cmd not in cmds:
+        cmds.append(cmd)
+        with open(AUTOSTART_FILE, 'w') as f: json.dump(cmds, f)
+        
+        # Start immediately
+        with open(LOG_FILE, "a") as log:
+            log.write(f"\n\n--- [MANUAL] Starting: {cmd} ---\n")
+            p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
+            autostart_processes.append({"cmd": cmd, "pid": p.pid})
+            
+    elif action == 'remove' and cmd in cmds:
+        cmds.remove(cmd)
+        with open(AUTOSTART_FILE, 'w') as f: json.dump(cmds, f)
+        
+        # Kill process
+        for p_info in autostart_processes:
+            if p_info["cmd"] == cmd:
+                try: os.killpg(os.getpgid(p_info["pid"]), signal.SIGKILL)
+                except: pass
+        autostart_processes = [p for p in autostart_processes if p["cmd"] != cmd]
+        
+    return jsonify({"success": True})
+
+@app.route('/api/logs')
+def api_logs():
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'r', errors='ignore') as f:
+            # Return last 10000 characters
+            return f.read()[-10000:]
+    return ""
+
 # ─────────────────────── WEBSOCKET LOGIC ─────────────────────
 @socketio.on('start_pty')
-def start_pty(data):
-    ws_id = data.get('ws_id')
-    # Join a dedicated room for this workspace so all inputs/outputs match
-    join_room(ws_id)
-    
-    if ws_id not in workspaces:
-        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
-    workspace = workspaces[ws_id]
-    workspace_last_seen[ws_id] = time.time()
-
-    if ws_id in active_terminals:
-        active_terminals[ws_id]["last_ping"] = time.time()
-        return
-
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.chdir(workspace)
-        os.execvp("bash", ["bash", "-i"])
-    else:
-        active_terminals[ws_id] = {
-            "fd": fd,
-            "pid": pid,
-            "last_ping": time.time()
-        }
-        
-        os.write(fd, b"PS1='\\[\\e[1;34m\\][rexi@cloud \\W]\\$ \\[\\e[0m\\]'\n")
-        os.write(fd, b"clear\n")
-
-        def read_pty():
-            while ws_id in active_terminals:
+def start_pty():
+    global active_terminal
+    if active_terminal:
+        active_terminal["last_ping"] = time.time()
+        fd = active_terminal["fd"]
+        def read_existing_pty():
+            while True:
                 try:
                     r, _, _ = select.select([fd], [], [], 0.1)
                     if fd in r:
                         output = os.read(fd, 1024)
                         if not output: break
-                        # Emit to the ws_id room
-                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=ws_id)
-                except:
-                    break
-            if ws_id in active_terminals:
-                del active_terminals[ws_id]
-            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Connection closed.\x1b[0m\r\n', room=ws_id)
+                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=request.sid)
+                except: break
+        socketio.start_background_task(read_existing_pty)
+        return
 
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(WORKSPACE_PATH)
+        os.execvp("bash", ["bash", "-i"])
+    else:
+        active_terminal = {"fd": fd, "pid": pid, "last_ping": time.time()}
+        os.write(fd, b"PS1='\\[\\e[1;34m\\][rexi@cloud \\W]\\$ \\[\\e[0m\\]'\n")
+        os.write(fd, b"clear\n")
+
+        def read_pty():
+            global active_terminal
+            while active_terminal:
+                try:
+                    r, _, _ = select.select([fd], [], [], 0.1)
+                    if fd in r:
+                        output = os.read(fd, 1024)
+                        if not output: break
+                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=request.sid)
+                except: break
+            active_terminal = None
+            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Connection closed.\x1b[0m\r\n', room=request.sid)
         socketio.start_background_task(read_pty)
 
 @socketio.on('pty_input')
-def on_pty_input(payload):
-    ws_id = payload.get('ws_id')
-    data = payload.get('data')
-    if ws_id in active_terminals:
-        fd = active_terminals[ws_id]["fd"]
-        try:
-            os.write(fd, data.encode('utf-8'))
-        except:
-            pass
+def on_pty_input(data):
+    if active_terminal:
+        try: os.write(active_terminal["fd"], data.encode('utf-8'))
+        except: pass
 
 @socketio.on('heartbeat')
-def on_heartbeat(data):
-    ws_id = data.get('ws_id')
-    if ws_id:
-        workspace_last_seen[ws_id] = time.time()
-        if ws_id in active_terminals:
-            active_terminals[ws_id]["last_ping"] = time.time()
+def on_heartbeat():
+    if active_terminal: active_terminal["last_ping"] = time.time()
 
 @socketio.on('show_upload_success')
-def show_upload_success(filename):
-    emit('upload_success', filename, room=request.sid)
+def show_upload_success(filename): emit('upload_success', filename, room=request.sid)
 
 @socketio.on('show_upload_error')
-def show_upload_error(error):
-    emit('upload_error', error, room=request.sid)
+def show_upload_error(error): emit('upload_error', error, room=request.sid)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
