@@ -2,6 +2,11 @@
 """
 REXI'S CLOUD TERMINAL & HOSTING PANEL
 """
+# ─── CRITICAL FIX: MONKEY PATCH MUST BE AT THE VERY TOP ───
+import eventlet
+eventlet.monkey_patch()
+# ──────────────────────────────────────────────────────────
+
 import os, sys, time, uuid, shutil, pty, select, signal, tempfile, threading
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 from flask_socketio import SocketIO, emit
@@ -15,32 +20,29 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_t
 ACCESS_KEY = "Rexi_Terminal_x60"
 
 # Global storage
-workspaces = {}         # { ws_id: directory_path }
-workspace_last_seen = {}# { ws_id: timestamp }
-active_terminals = {}   # { socket_id: { fd, pid, ws_id, last_ping } }
+workspaces = {}         
+workspace_last_seen = {} 
+active_terminals = {}   
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
 def cleanup_watchdog():
-    """Kills processes and deletes files if the browser tab is closed."""
     while True:
         time.sleep(5)
         now = time.time()
         
-        # 1. Kill stalled terminals
+        # Kill stalled terminals
         for sid in list(active_terminals.keys()):
             sess = active_terminals[sid]
             if now - sess["last_ping"] > 15:
-                print(f"[!] Killing stalled terminal {sid}")
                 try: os.kill(sess["pid"], signal.SIGKILL)
                 except: pass
                 try: os.close(sess["fd"])
                 except: pass
                 del active_terminals[sid]
 
-        # 2. Delete files for closed workspaces
+        # Delete files for closed workspaces
         for ws_id in list(workspaces.keys()):
             if now - workspace_last_seen.get(ws_id, 0) > 15:
-                print(f"[!] Deleting workspace {ws_id}")
                 shutil.rmtree(workspaces[ws_id], ignore_errors=True)
                 del workspaces[ws_id]
                 if ws_id in workspace_last_seen: del workspace_last_seen[ws_id]
@@ -126,9 +128,9 @@ TERMINAL_HTML = """
         <div class="glass rounded-2xl h-full flex flex-col overflow-hidden shadow-[0_0_50px_rgba(79,70,229,0.1)] border-indigo-500/20">
             <div class="bg-gray-900/80 px-4 py-2 flex items-center justify-between border-b border-gray-800">
                 <span class="text-xs text-indigo-400 font-mono tracking-widest">TERMINAL // ISOLATED WORKSPACE</span>
-                <span class="text-xs text-gray-500 font-mono">Status: <span class="text-green-400">Connected</span></span>
+                <span class="text-xs text-gray-500 font-mono">Status: <span class="text-green-400" id="statusText">Connected</span></span>
             </div>
-            <div id="terminal-container"></div>
+            <div id="terminal-container" onclick="term.focus()"></div>
         </div>
     </div>
 
@@ -145,18 +147,26 @@ TERMINAL_HTML = """
         term.loadAddon(fitAddon);
         term.open(document.getElementById('terminal-container'));
         fitAddon.fit();
+        term.focus(); // Auto-focus the keyboard
 
         const socket = io();
 
         socket.on('connect', () => {
+            document.getElementById('statusText').innerText = "Connected";
             socket.emit('start_pty', { ws_id: ws_id });
             setInterval(() => { socket.emit('heartbeat', { ws_id: ws_id }); }, 3000);
+        });
+
+        socket.on('disconnect', () => {
+            document.getElementById('statusText').innerText = "Disconnected";
+            document.getElementById('statusText').className = "text-red-400";
         });
 
         socket.on('pty_output', (data) => { term.write(data); });
         socket.on('upload_success', (filename) => { term.write(`\\r\\n\\x1b[1;32m[+] File ${filename} uploaded!\\x1b[0m\\r\\n`); });
         socket.on('upload_error', (err) => { term.write(`\\r\\n\\x1b[1;31m[!] Upload failed: ${err}\\x1b[0m\\r\\n`); });
 
+        // This captures every key you press and sends it to the server
         term.onData((data) => { socket.emit('pty_input', data); });
 
         function uploadFile() {
@@ -208,7 +218,6 @@ def logout():
 def index():
     if not session.get('logged_in'): return redirect(url_for('login'))
     
-    # Ensure workspace exists
     ws_id = session.get('ws_id')
     if ws_id not in workspaces:
         workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
@@ -222,7 +231,7 @@ def upload():
     
     ws_id = session.get('ws_id')
     if ws_id not in workspaces:
-        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_") # Auto-recover
+        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
         
     file = request.files.get('file')
     if not file: return jsonify({"success": False, "error": "No file"})
@@ -237,21 +246,19 @@ def start_pty(data):
     sid = request.sid
     ws_id = data.get('ws_id')
     
-    # Ensure workspace exists
     if ws_id not in workspaces:
         workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
     workspace = workspaces[ws_id]
     workspace_last_seen[ws_id] = time.time()
 
-    # Fork a real bash terminal
     pid, fd = pty.fork()
     
     if pid == 0:
-        # CHILD PROCESS
+        # Child process
         os.chdir(workspace)
         os.execvp("bash", ["bash", "-i"])
     else:
-        # PARENT PROCESS
+        # Parent process
         active_terminals[sid] = {
             "fd": fd,
             "pid": pid,
@@ -259,7 +266,6 @@ def start_pty(data):
             "last_ping": time.time()
         }
         
-        # Send initial prompt styling
         os.write(fd, b"PS1='\\[\\e[1;34m\\][rexi@cloud \\W]\\$ \\[\\e[0m\\]'\n")
         os.write(fd, b"clear\n")
 
@@ -286,9 +292,10 @@ def on_pty_input(data):
     if sid in active_terminals:
         fd = active_terminals[sid]["fd"]
         try:
+            # Force write to the terminal
             os.write(fd, data.encode('utf-8'))
-        except:
-            pass
+        except Exception as e:
+            print(f"Write error: {e}")
 
 @socketio.on('heartbeat')
 def on_heartbeat(data):
@@ -309,7 +316,5 @@ def show_upload_error(error):
     emit('upload_error', error, room=request.sid)
 
 if __name__ == "__main__":
-    print("[+] REXI CLOUD BOOTING...")
-    print(f"[+] Access Key: {ACCESS_KEY}")
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
