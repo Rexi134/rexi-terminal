@@ -4,7 +4,7 @@ eventlet.monkey_patch()
 
 import os, sys, time, shutil, pty, select, signal, tempfile, threading, requests, base64, subprocess, json
 from flask import Flask, render_template_string, request, jsonify
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
@@ -36,12 +36,11 @@ def ensure_repo_exists():
     url = f"https://api.github.com/repos/{GITHUB_REPO}"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     if requests.get(url, headers=headers).status_code == 404:
-        print(f"[+] Repo {GITHUB_REPO} not found. Creating it now...")
         requests.post("https://api.github.com/user/repos", headers=headers, json={"name": REPO_NAME, "private": True})
 
 def backup_workspace():
     while True:
-        time.sleep(60)
+        time.sleep(30) # Backup every 30 seconds to be safe
         if not GITHUB_TOKEN.startswith("ghp_"): continue
         try:
             res = github_api("GET", "contents/")
@@ -52,7 +51,9 @@ def backup_workspace():
 
             for filename in os.listdir(WORKSPACE_PATH):
                 filepath = os.path.join(WORKSPACE_PATH, filename)
-                if not os.path.isfile(filepath) or filename.startswith('.') or filename == "bot_logs.txt": continue
+                # Now we backup EVERYTHING except the log file and python cache
+                if not os.path.isfile(filepath) or filename.startswith('.') or filename == "bot_logs.txt" or filename.endswith(".pyc"): 
+                    continue
                 
                 with open(filepath, "rb") as f:
                     content = base64.b64encode(f.read()).decode()
@@ -73,7 +74,6 @@ def restore_workspace():
                     dl = requests.get(item["download_url"])
                     with open(os.path.join(WORKSPACE_PATH, item["name"]), "wb") as f:
                         f.write(dl.content)
-            print("[+] Files restored from GitHub!")
     except: pass
 
 # ─────────────────── AUTO HOST SYSTEM ─────────────────────────
@@ -88,7 +88,6 @@ def start_autostart_bots():
             cmds = json.load(f)
             
         for cmd in cmds:
-            # Start the process and redirect output to LOG_FILE
             with open(LOG_FILE, "a") as log:
                 log.write(f"\n\n--- [SYSTEM BOOT] Starting: {cmd} ---\n")
                 p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
@@ -100,9 +99,7 @@ def start_autostart_bots():
 ensure_repo_exists()
 threading.Thread(target=backup_workspace, daemon=True).start()
 threading.Thread(target=restore_workspace, daemon=True).start()
-
-# Start autostart bots after files are restored
-threading.Timer(5.0, start_autostart_bots).start()
+threading.Timer(10.0, start_autostart_bots).start() # Wait 10 seconds for files to download before hosting
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
 def cleanup_watchdog():
@@ -175,7 +172,7 @@ TERMINAL_HTML = """
                 <span class="text-xs text-indigo-400 font-mono tracking-widest">MASTER TERMINAL</span>
                 <span class="text-xs text-gray-500 font-mono">Status: <span class="text-green-400" id="statusText">Connected</span></span>
             </div>
-            <div id="terminal-container" onclick="term.focus()"></div>
+            <div id="terminal-container" onclick="focusTerm()"></div>
         </div>
     </div>
 
@@ -207,7 +204,7 @@ TERMINAL_HTML = """
                 <button onclick="closeAutoHost()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
             </div>
             <div class="p-4 flex gap-2 border-b border-gray-700">
-                <input type="text" id="hostCmd" placeholder="e.g. python are.py" class="flex-1 bg-gray-900 border border-gray-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-green-500">
+                <input type="text" id="hostCmd" placeholder="e.g. python tg_bot.py" class="flex-1 bg-gray-900 border border-gray-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-green-500">
                 <button onclick="addAutoHost()" class="bg-green-600 hover:bg-green-500 text-white font-bold px-6 rounded-lg">Add</button>
             </div>
             <div class="flex-1 flex overflow-hidden">
@@ -234,14 +231,18 @@ TERMINAL_HTML = """
         term.loadAddon(fitAddon);
         term.open(document.getElementById('terminal-container'));
         fitAddon.fit();
-
-        document.getElementById('terminal-container').addEventListener('touchstart', () => { term.focus(); }, {passive: true});
+        
+        function focusTerm() { term.focus(); }
+        setTimeout(focusTerm, 500);
+        document.getElementById('terminal-container').addEventListener('touchstart', focusTerm, {passive: true});
+        document.getElementById('terminal-container').addEventListener('click', focusTerm, {passive: true});
 
         const socket = io();
 
         socket.on('connect', () => {
             document.getElementById('statusText').innerText = "Connected";
             document.getElementById('statusText').className = "text-green-400";
+            socket.emit('join_master');
             socket.emit('start_pty');
             setInterval(() => { socket.emit('heartbeat'); }, 10000);
         });
@@ -389,6 +390,7 @@ def upload():
 
 @app.route('/api/files')
 def api_files():
+    # Hide the log and json to keep the UI clean
     files = [f for f in os.listdir(WORKSPACE_PATH) if os.path.isfile(os.path.join(WORKSPACE_PATH, f)) and not f.startswith('.') and f not in ('bot_logs.txt', 'autostart.json')]
     return jsonify(files)
 
@@ -442,7 +444,6 @@ def api_autohost():
         cmds.append(cmd)
         with open(AUTOSTART_FILE, 'w') as f: json.dump(cmds, f)
         
-        # Start immediately
         with open(LOG_FILE, "a") as log:
             log.write(f"\n\n--- [MANUAL] Starting: {cmd} ---\n")
             p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
@@ -452,7 +453,6 @@ def api_autohost():
         cmds.remove(cmd)
         with open(AUTOSTART_FILE, 'w') as f: json.dump(cmds, f)
         
-        # Kill process
         for p_info in autostart_processes:
             if p_info["cmd"] == cmd:
                 try: os.killpg(os.getpgid(p_info["pid"]), signal.SIGKILL)
@@ -465,27 +465,20 @@ def api_autohost():
 def api_logs():
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'r', errors='ignore') as f:
-            # Return last 10000 characters
             return f.read()[-10000:]
     return ""
 
 # ─────────────────────── WEBSOCKET LOGIC ─────────────────────
+@socketio.on('join_master')
+def on_join():
+    join_room("master_terminal")
+    emit('pty_output', '\r\n\x1b[1;32m[+] Connected to Master Terminal.\x1b[0m\r\n', room="master_terminal")
+
 @socketio.on('start_pty')
 def start_pty():
     global active_terminal
     if active_terminal:
         active_terminal["last_ping"] = time.time()
-        fd = active_terminal["fd"]
-        def read_existing_pty():
-            while True:
-                try:
-                    r, _, _ = select.select([fd], [], [], 0.1)
-                    if fd in r:
-                        output = os.read(fd, 1024)
-                        if not output: break
-                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=request.sid)
-                except: break
-        socketio.start_background_task(read_existing_pty)
         return
 
     pid, fd = pty.fork()
@@ -505,10 +498,10 @@ def start_pty():
                     if fd in r:
                         output = os.read(fd, 1024)
                         if not output: break
-                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=request.sid)
+                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room="master_terminal")
                 except: break
             active_terminal = None
-            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Connection closed.\x1b[0m\r\n', room=request.sid)
+            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Terminal closed.\x1b[0m\r\n', room="master_terminal")
         socketio.start_background_task(read_pty)
 
 @socketio.on('pty_input')
@@ -522,10 +515,10 @@ def on_heartbeat():
     if active_terminal: active_terminal["last_ping"] = time.time()
 
 @socketio.on('show_upload_success')
-def show_upload_success(filename): emit('upload_success', filename, room=request.sid)
+def show_upload_success(filename): emit('upload_success', filename, room="master_terminal")
 
 @socketio.on('show_upload_error')
-def show_upload_error(error): emit('upload_error', error, room=request.sid)
+def show_upload_error(error): emit('upload_error', error, room="master_terminal")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
