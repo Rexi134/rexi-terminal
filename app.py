@@ -2,38 +2,48 @@
 """
 REXI'S CLOUD TERMINAL & HOSTING PANEL
 """
-import os, sys, time, uuid, shutil, subprocess, pty, select, signal, tempfile, threading
+import os, sys, time, uuid, shutil, pty, select, signal, tempfile, threading
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
-app.secret_key = "REXI_SUPREME_SECRET"
+app.secret_key = "REXI_SUPREME_SECRET_99"
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024 # 50MB max upload
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=30)
 
 ACCESS_KEY = "Rexi_Terminal_x60"
 
-# Tracks active sessions: { socket_sid: { "workspace": path, "pid": pid, "master_fd": fd, "last_ping": timestamp } }
-active_sessions = {}
+# Global storage
+workspaces = {}         # { ws_id: directory_path }
+workspace_last_seen = {}# { ws_id: timestamp }
+active_terminals = {}   # { socket_id: { fd, pid, ws_id, last_ping } }
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
 def cleanup_watchdog():
-    """Kills processes and deletes files if the browser tab is closed (no heartbeat for 15s)."""
+    """Kills processes and deletes files if the browser tab is closed."""
     while True:
         time.sleep(5)
         now = time.time()
-        for sid in list(active_sessions.keys()):
-            sess = active_sessions[sid]
-            # 15 seconds grace period for page refreshes
-            if now - sess["last_ping"] > 15: 
-                print(f"[!] Tab closed or timed out. Cleaning up workspace for {sid}")
-                if "pid" in sess:
-                    try: os.killpg(os.getpgid(sess["pid"]), signal.SIGKILL)
-                    except: pass
-                if os.path.exists(sess["workspace"]):
-                    shutil.rmtree(sess["workspace"], ignore_errors=True)
-                del active_sessions[sid]
+        
+        # 1. Kill stalled terminals
+        for sid in list(active_terminals.keys()):
+            sess = active_terminals[sid]
+            if now - sess["last_ping"] > 15:
+                print(f"[!] Killing stalled terminal {sid}")
+                try: os.kill(sess["pid"], signal.SIGKILL)
+                except: pass
+                try: os.close(sess["fd"])
+                except: pass
+                del active_terminals[sid]
+
+        # 2. Delete files for closed workspaces
+        for ws_id in list(workspaces.keys()):
+            if now - workspace_last_seen.get(ws_id, 0) > 15:
+                print(f"[!] Deleting workspace {ws_id}")
+                shutil.rmtree(workspaces[ws_id], ignore_errors=True)
+                del workspaces[ws_id]
+                if ws_id in workspace_last_seen: del workspace_last_seen[ws_id]
 
 threading.Thread(target=cleanup_watchdog, daemon=True).start()
 
@@ -98,11 +108,10 @@ TERMINAL_HTML = """
 <body class="h-screen flex flex-col relative">
     <div class="stars"></div>
     
-    <!-- Top Bar -->
     <div class="glass px-6 py-4 rounded-b-3xl z-10 flex justify-between items-center shadow-2xl border-t-0">
         <div class="flex items-center gap-3">
             <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
-            <h1 class="text-xl font-bold tracking-wider text-indigo-300">REXI CLOUD ENGINE</h1>
+            <h1 class="text-xl font-bold tracking-wider text-indigo-300">REXI CLOUD</h1>
         </div>
         <div class="flex gap-4">
             <button onclick="document.getElementById('fileInput').click()" class="bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/50 text-indigo-300 hover:text-white px-4 py-2 rounded-lg transition-all text-sm font-bold flex items-center gap-2">
@@ -117,19 +126,20 @@ TERMINAL_HTML = """
         <div class="glass rounded-2xl h-full flex flex-col overflow-hidden shadow-[0_0_50px_rgba(79,70,229,0.1)] border-indigo-500/20">
             <div class="bg-gray-900/80 px-4 py-2 flex items-center justify-between border-b border-gray-800">
                 <span class="text-xs text-indigo-400 font-mono tracking-widest">TERMINAL // ISOLATED WORKSPACE</span>
-                <span class="text-xs text-gray-500 font-mono">Status: <span id="statusText" class="text-green-400">Connected</span></span>
+                <span class="text-xs text-gray-500 font-mono">Status: <span class="text-green-400">Connected</span></span>
             </div>
             <div id="terminal-container"></div>
         </div>
     </div>
 
     <script>
+        const ws_id = "{{ session.get('ws_id', '') }}";
+        
         const term = new Terminal({
             cursorBlink: true,
             theme: { background: 'transparent', foreground: '#e2e8f0', cursor: '#6366f1', selectionBackground: '#4f46e5' },
             fontFamily: "'JetBrains Mono', monospace",
-            fontSize: 14,
-            lineHeight: 1.2
+            fontSize: 14
         });
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);
@@ -139,22 +149,15 @@ TERMINAL_HTML = """
         const socket = io();
 
         socket.on('connect', () => {
-            term.write('\\r\\n\\x1b[1;35m[SYSTEM] Initializing secure cloud shell...\\x1b[0m\\r\\n');
-            socket.emit('start_pty');
-            
-            // HEARTBEAT: Keeps the server alive as long as the tab is open
-            setInterval(() => { socket.emit('heartbeat'); }, 3000);
+            socket.emit('start_pty', { ws_id: ws_id });
+            setInterval(() => { socket.emit('heartbeat', { ws_id: ws_id }); }, 3000);
         });
 
         socket.on('pty_output', (data) => { term.write(data); });
-        socket.on('upload_success', (filename) => { term.write(`\\r\\n\\x1b[1;32m[+] File ${filename} uploaded successfully.\\x1b[0m\\r\\n`); });
+        socket.on('upload_success', (filename) => { term.write(`\\r\\n\\x1b[1;32m[+] File ${filename} uploaded!\\x1b[0m\\r\\n`); });
         socket.on('upload_error', (err) => { term.write(`\\r\\n\\x1b[1;31m[!] Upload failed: ${err}\\x1b[0m\\r\\n`); });
 
         term.onData((data) => { socket.emit('pty_input', data); });
-
-        window.addEventListener('resize', () => {
-            fitAddon.fit();
-        });
 
         function uploadFile() {
             const fileInput = document.getElementById('fileInput');
@@ -186,104 +189,116 @@ def login():
     if request.method == 'POST':
         if request.form.get('key') == ACCESS_KEY:
             session['logged_in'] = True
-            # Create a unique workspace folder for this specific browser session
-            if 'workspace' not in session:
-                session['workspace'] = tempfile.mkdtemp(prefix="rexi_ws_")
+            if 'ws_id' not in session:
+                session['ws_id'] = str(uuid.uuid4())
             return redirect(url_for('index'))
         return render_template_string(LOGIN_HTML, error="Invalid Access Key")
     return render_template_string(LOGIN_HTML)
 
 @app.route('/logout')
 def logout():
+    ws_id = session.get('ws_id')
+    if ws_id in workspaces:
+        shutil.rmtree(workspaces[ws_id], ignore_errors=True)
+        del workspaces[ws_id]
     session.clear()
     return redirect(url_for('login'))
 
 @app.route('/')
 def index():
     if not session.get('logged_in'): return redirect(url_for('login'))
+    
+    # Ensure workspace exists
+    ws_id = session.get('ws_id')
+    if ws_id not in workspaces:
+        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
+    workspace_last_seen[ws_id] = time.time()
+    
     return render_template_string(TERMINAL_HTML)
 
 @app.route('/upload', methods=['POST'])
 def upload():
     if not session.get('logged_in'): return jsonify({"success": False, "error": "Unauthorized"})
-    if 'file' not in request.files: return jsonify({"success": False, "error": "No file part"})
     
-    file = request.files['file']
-    if file.filename == '': return jsonify({"success": False, "error": "No selected file"})
-    
-    workspace = session.get('workspace')
-    if not workspace or not os.path.exists(workspace):
-        return jsonify({"success": False, "error": "Workspace expired. Please refresh the page."})
+    ws_id = session.get('ws_id')
+    if ws_id not in workspaces:
+        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_") # Auto-recover
         
-    filepath = os.path.join(workspace, file.filename)
+    file = request.files.get('file')
+    if not file: return jsonify({"success": False, "error": "No file"})
+        
+    filepath = os.path.join(workspaces[ws_id], file.filename)
     file.save(filepath)
-    
     return jsonify({"success": True})
 
 # ─────────────────────── WEBSOCKET LOGIC ─────────────────────
-@socketio.on('connect')
-def on_connect():
-    pass
-
 @socketio.on('start_pty')
-def start_pty():
+def start_pty(data):
     sid = request.sid
-    workspace = session.get('workspace')
+    ws_id = data.get('ws_id')
     
-    if not workspace:
-        workspace = tempfile.mkdtemp(prefix="rexi_ws_")
-        session['workspace'] = workspace
+    # Ensure workspace exists
+    if ws_id not in workspaces:
+        workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
+    workspace = workspaces[ws_id]
+    workspace_last_seen[ws_id] = time.time()
 
-    active_sessions[sid] = {
-        "workspace": workspace,
-        "last_ping": time.time()
-    }
-
-    # Spawn bash in a pseudo-terminal
-    master, slave = pty.openpty()
-    p = subprocess.Popen(
-        ['bash'], 
-        stdin=slave, stdout=slave, stderr=slave,
-        preexec_fn=os.setsid,
-        cwd=workspace
-    )
-    os.close(slave)
+    # Fork a real bash terminal
+    pid, fd = pty.fork()
     
-    active_sessions[sid]["pid"] = p.pid
-    active_sessions[sid]["master_fd"] = master  # Store FD to allow typing
-    
-    # Setup prompt
-    os.write(master, b"PS1='\\[\\e[1;34m\\][rexi@cloud \\W]\\$ \\[\\e[0m\\]'\n")
-    os.write(master, b"clear\n")
+    if pid == 0:
+        # CHILD PROCESS
+        os.chdir(workspace)
+        os.execvp("bash", ["bash", "-i"])
+    else:
+        # PARENT PROCESS
+        active_terminals[sid] = {
+            "fd": fd,
+            "pid": pid,
+            "ws_id": ws_id,
+            "last_ping": time.time()
+        }
+        
+        # Send initial prompt styling
+        os.write(fd, b"PS1='\\[\\e[1;34m\\][rexi@cloud \\W]\\$ \\[\\e[0m\\]'\n")
+        os.write(fd, b"clear\n")
 
-    def read_pty():
-        while sid in active_sessions:
-            try:
-                r, _, _ = select.select([master], [], [], 0.1)
-                if master in r:
-                    data = os.read(master, 1024)
-                    if not data: break
-                    socketio.emit('pty_output', data.decode('utf-8', errors='replace'), room=sid)
-            except:
-                break
-        socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Session terminated.\x1b[0m\r\n', room=sid)
+        def read_pty():
+            while sid in active_terminals:
+                try:
+                    r, _, _ = select.select([fd], [], [], 0.1)
+                    if fd in r:
+                        output = os.read(fd, 1024)
+                        if not output: break
+                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=sid)
+                except:
+                    break
+                    
+            if sid in active_terminals:
+                del active_terminals[sid]
+            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Connection closed.\x1b[0m\r\n', room=sid)
 
-    socketio.start_background_task(read_pty)
+        socketio.start_background_task(read_pty)
 
 @socketio.on('pty_input')
 def on_pty_input(data):
     sid = request.sid
-    if sid in active_sessions:
-        master_fd = active_sessions[sid].get("master_fd")
-        if master_fd:
-            try: os.write(master_fd, data.encode('utf-8'))
-            except: pass
+    if sid in active_terminals:
+        fd = active_terminals[sid]["fd"]
+        try:
+            os.write(fd, data.encode('utf-8'))
+        except:
+            pass
 
 @socketio.on('heartbeat')
-def on_heartbeat():
+def on_heartbeat(data):
     sid = request.sid
-    if sid in active_sessions:
-        active_sessions[sid]["last_ping"] = time.time()
+    ws_id = data.get('ws_id')
+    
+    if ws_id:
+        workspace_last_seen[ws_id] = time.time()
+    if sid in active_terminals:
+        active_terminals[sid]["last_ping"] = time.time()
 
 @socketio.on('show_upload_success')
 def show_upload_success(filename):
