@@ -21,8 +21,8 @@ AUTOSTART_FILE = os.path.join(WORKSPACE_PATH, "autostart.json")
 LOG_FILE = os.path.join(WORKSPACE_PATH, "bot_logs.txt")
 
 active_terminal = None
-workspace_last_seen = time.time()
 autostart_processes = []
+backup_lock = threading.Lock()
 
 # ─────────────────── GITHUB BACKUP SYSTEM ─────────────────────
 def github_api(method, path, data=None):
@@ -37,10 +37,10 @@ def ensure_repo_exists():
     if requests.get(url, headers=headers).status_code == 404:
         requests.post("https://api.github.com/user/repos", headers=headers, json={"name": REPO_NAME, "private": True})
 
-def backup_workspace():
-    while True:
-        time.sleep(30)
-        if not GITHUB_TOKEN.startswith("ghp_"): continue
+def force_backup():
+    """Pushes all files to GitHub instantly."""
+    with backup_lock:
+        if not GITHUB_TOKEN.startswith("ghp_"): return
         try:
             res = github_api("GET", "contents/")
             repo_files = {}
@@ -53,40 +53,62 @@ def backup_workspace():
                 
                 with open(filepath, "rb") as f: content = base64.b64encode(f.read()).decode()
                 
-                data = {"message": f"Auto-backup {filename}", "content": content}
+                data = {"message": f"Instant backup {filename}", "content": content}
                 if filename in repo_files: data["sha"] = repo_files[filename]
                 github_api("PUT", f"contents/{filename}", data)
-        except: pass
+        except Exception as e:
+            print(f"[Backup Error] {e}")
+
+def periodic_backup():
+    while True:
+        time.sleep(15) # Backup every 15 seconds now
+        force_backup()
 
 def restore_workspace():
+    """Downloads files from GitHub on startup."""
     if not GITHUB_TOKEN.startswith("ghp_"): return
+    print("[+] Restoring files from GitHub...")
     try:
         res = github_api("GET", "contents/")
         if res.status_code == 200:
             for item in res.json():
                 if item["type"] == "file":
                     dl = requests.get(item["download_url"])
-                    with open(os.path.join(WORKSPACE_PATH, item["name"]), "wb") as f: f.write(dl.content)
-    except: pass
+                    with open(os.path.join(WORKSPACE_PATH, item["name"]), "wb") as f: 
+                        f.write(dl.content)
+            print("[+] Files restored successfully!")
+        else:
+            print("[-] No files found on GitHub.")
+    except Exception as e:
+        print(f"[Restore Error] {e}")
 
 # ─────────────────── AUTO HOST SYSTEM ─────────────────────────
 def start_autostart_bots():
     global autostart_processes
     if not os.path.exists(AUTOSTART_FILE):
+        print("[-] No autostart.json found. Starting empty.")
         with open(AUTOSTART_FILE, "w") as f: json.dump([], f)
         return
+        
     try:
-        with open(AUTOSTART_FILE, "r") as f: cmds = json.load(f)
+        with open(AUTOSTART_FILE, "r") as f: 
+            cmds = json.load(f)
+            
+        print(f"[+] Found {len(cmds)} auto-host commands. Starting them now...")
         for cmd in cmds:
             with open(LOG_FILE, "a") as log:
                 log.write(f"\n\n--- [SYSTEM BOOT] Starting: {cmd} ---\n")
                 p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
                 autostart_processes.append({"cmd": cmd, "pid": p.pid})
-    except: pass
+    except Exception as e:
+        print(f"[Auto-start error] {e}")
 
+# ─────────────────── BOOT SEQUENCE ────────────────────────────
 ensure_repo_exists()
-threading.Thread(target=backup_workspace, daemon=True).start()
-threading.Thread(target=restore_workspace, daemon=True).start()
+restore_workspace() # Restore synchronously so files exist before bots start
+threading.Thread(target=periodic_backup, daemon=True).start()
+
+# Wait 10 seconds to ensure GitHub download finishes before starting bots
 threading.Timer(10.0, start_autostart_bots).start()
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
@@ -122,8 +144,6 @@ TERMINAL_HTML = """
         #terminal-container { height: calc(100vh - 120px); width: 100%; padding: 10px; background: #000; border-radius: 8px; }
         .xterm-viewport::-webkit-scrollbar { width: 6px; }
         .xterm-viewport::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-        
-        /* Force keyboard to stay open */
         .xterm-helper-textarea { z-index: 9999 !important; }
     </style>
 </head>
@@ -148,7 +168,7 @@ TERMINAL_HTML = """
     <!-- Terminal -->
     <div id="terminal-container" onclick="term.focus()"></div>
 
-    <!-- File Manager Modal (Solid Background) -->
+    <!-- File Manager Modal -->
     <div id="fileManagerModal" class="fixed inset-0 bg-black z-50 flex items-center justify-center hidden p-4">
         <div class="bg-gray-800 border border-gray-600 w-full max-w-3xl h-[80vh] rounded-xl flex flex-col overflow-hidden shadow-2xl relative">
             <button onclick="closeModal('fileManagerModal')" class="absolute top-3 right-3 text-white bg-red-600 hover:bg-red-500 w-8 h-8 rounded-full font-bold flex items-center justify-center z-50">✖</button>
@@ -168,7 +188,7 @@ TERMINAL_HTML = """
         </div>
     </div>
 
-    <!-- Auto-Host Modal (Solid Background) -->
+    <!-- Auto-Host Modal -->
     <div id="autoHostModal" class="fixed inset-0 bg-black z-50 flex items-center justify-center hidden p-4">
         <div class="bg-gray-800 border border-gray-600 w-full max-w-3xl h-[80vh] rounded-xl flex flex-col overflow-hidden shadow-2xl relative">
             <button onclick="closeModal('autoHostModal')" class="absolute top-3 right-3 text-white bg-red-600 hover:bg-red-500 w-8 h-8 rounded-full font-bold flex items-center justify-center z-50">✖</button>
@@ -176,7 +196,7 @@ TERMINAL_HTML = """
                 <h2 class="text-lg font-bold text-green-400">🚀 Auto-Host Engine</h2>
             </div>
             <div class="p-4 flex gap-2 border-b border-gray-600 bg-gray-900">
-                <input type="text" id="hostCmd" placeholder="e.g. python tg_bot.py" class="flex-1 bg-gray-800 border border-gray-600 rounded p-2 text-white text-sm focus:outline-none focus:border-green-500">
+                <input type="text" id="hostCmd" placeholder="e.g. python ok.py" class="flex-1 bg-gray-800 border border-gray-600 rounded p-2 text-white text-sm focus:outline-none focus:border-green-500">
                 <button onclick="addAutoHost()" class="bg-green-600 hover:bg-green-500 text-white font-bold px-6 rounded text-sm">Add</button>
             </div>
             <div class="flex-1 flex overflow-hidden">
@@ -204,16 +224,11 @@ TERMINAL_HTML = """
         term.open(document.getElementById('terminal-container'));
         fitAddon.fit();
 
-        // Aggressive mobile focus fix
         const terminalDiv = document.getElementById('terminal-container');
-        function forceFocus(e) {
-            if(e) e.preventDefault();
-            term.focus();
-        }
+        function forceFocus(e) { if(e) e.preventDefault(); term.focus(); }
         terminalDiv.addEventListener('touchstart', forceFocus, {passive: false});
         terminalDiv.addEventListener('click', forceFocus, {passive: false});
         setTimeout(forceFocus, 500);
-        setTimeout(forceFocus, 2000);
 
         const socket = io();
 
@@ -223,11 +238,7 @@ TERMINAL_HTML = """
             setInterval(() => { socket.emit('heartbeat'); }, 10000);
         });
 
-        // If terminal died on backend, restart it automatically
-        socket.on('restart_pty', () => {
-            socket.emit('start_pty');
-        });
-
+        socket.on('restart_pty', () => { socket.emit('start_pty'); });
         socket.on('pty_output', (data) => { term.write(data); });
         socket.on('upload_success', (filename) => { term.write(`\\r\\n\\x1b[1;32m[+] File ${filename} uploaded!\\x1b[0m\\r\\n`); });
         socket.on('upload_error', (err) => { term.write(`\\r\\n\\x1b[1;31m[!] Upload failed: ${err}\\x1b[0m\\r\\n`); });
@@ -236,22 +247,18 @@ TERMINAL_HTML = """
 
         function sendCtrlC() { socket.emit('pty_input', '\\x03'); term.focus(); }
 
-        // ── MODAL CONTROLS ──
         function openModal(id) {
             document.getElementById(id).classList.remove('hidden');
             if(id === 'fileManagerModal') loadFiles();
             if(id === 'autoHostModal') loadAutoHost();
         }
-        function closeModal(id) {
-            document.getElementById(id).classList.add('hidden');
-        }
+        function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 
         // ── FILE MANAGER ──
         let currentFile = null;
         function loadFiles() {
             const listDiv = document.getElementById('fileListDiv');
             listDiv.innerHTML = '<div class="text-gray-400 text-xs text-center mt-4">Loading...</div>';
-            
             fetch('/api/files').then(r => r.json()).then(files => {
                 listDiv.innerHTML = '';
                 if (files.length === 0) { listDiv.innerHTML = '<div class="text-gray-400 text-xs text-center mt-4">No files.</div>'; return; }
@@ -262,8 +269,6 @@ TERMINAL_HTML = """
                             <button onclick="event.stopPropagation(); deleteFile('${f}')" class="text-red-500 hover:text-red-400 px-2">✖</button>
                         </div>`;
                 });
-            }).catch(e => {
-                listDiv.innerHTML = '<div class="text-red-500 text-xs text-center mt-4">Error loading files.</div>';
             });
         }
 
@@ -289,7 +294,7 @@ TERMINAL_HTML = """
             if (!currentFile) return;
             const content = document.getElementById('codeEditor').value;
             fetch('/api/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({file: currentFile, content: content}) })
-            .then(r => r.json()).then(res => { if (res.success) alert("Saved!"); else alert("Error: " + res.error); });
+            .then(r => r.json()).then(res => { if (res.success) alert("Saved and pushed to GitHub!"); else alert("Error: " + res.error); });
         }
 
         function deleteFile(filename) {
@@ -321,7 +326,7 @@ TERMINAL_HTML = """
                     else socket.emit('show_upload_error', res.error);
                 });
             fileInput.value = ''; 
-            loadFiles(); // Refresh list in case modal is open
+            loadFiles();
         }
 
         // ── AUTO-HOST ──
@@ -382,6 +387,7 @@ def upload():
     if not file: return jsonify({"success": False, "error": "No file"})
     filepath = os.path.join(WORKSPACE_PATH, file.filename)
     file.save(filepath)
+    force_backup() # INSTANT BACKUP
     return jsonify({"success": True})
 
 @app.route('/api/files')
@@ -406,6 +412,7 @@ def api_save():
     try:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(data['content'])
+        force_backup() # INSTANT BACKUP
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
@@ -416,6 +423,7 @@ def api_delete():
     path = os.path.join(WORKSPACE_PATH, filename)
     try:
         os.remove(path)
+        force_backup()
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
@@ -454,6 +462,7 @@ def api_autohost():
                 except: pass
         autostart_processes = [p for p in autostart_processes if p["cmd"] != cmd]
         
+    force_backup() # INSTANT BACKUP of autostart.json
     return jsonify({"success": True})
 
 @app.route('/api/logs')
@@ -511,7 +520,6 @@ def on_heartbeat():
     if active_terminal:
         active_terminal["last_ping"] = time.time()
     else:
-        # If the terminal died on the server, tell the client to restart it
         emit('restart_pty', room=request.sid)
 
 @socketio.on('show_upload_success')
