@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-REXI'S CLOUD TERMINAL & HOSTING PANEL
+REXI'S CLOUD TERMINAL & HOSTING PANEL - ULTIMATE EDITION
 """
 import eventlet
 eventlet.monkey_patch()
 
 import os, sys, time, uuid, shutil, pty, select, signal, tempfile, threading
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room
 
 app = Flask(__name__)
 app.secret_key = "REXI_SUPREME_SECRET_99"
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024 # 50MB max upload
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=60)
 
 ACCESS_KEY = "Rexi_Terminal_x60"
 
-# Global storage
-# Note: active_terminals is mapped by ws_id (not socket sid) so refreshing doesn't kill the shell
 workspaces = {}         
 workspace_last_seen = {} 
-active_terminals = {}   # { ws_id: { fd, pid, last_ping } }
+active_terminals = {}   
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
 def cleanup_watchdog():
@@ -29,21 +27,19 @@ def cleanup_watchdog():
         time.sleep(10)
         now = time.time()
         
-        # 1. Kill stalled terminals (600s = 10 minutes grace period)
+        # 1. Kill stalled terminals (3600s = 1 hour grace period)
         for ws_id in list(active_terminals.keys()):
             sess = active_terminals[ws_id]
-            if now - sess["last_ping"] > 600:
-                print(f"[!] Killing stalled terminal {ws_id}")
+            if now - sess["last_ping"] > 3600:
                 try: os.kill(sess["pid"], signal.SIGKILL)
                 except: pass
                 try: os.close(sess["fd"])
                 except: pass
                 del active_terminals[ws_id]
 
-        # 2. Delete files for closed workspaces (600s = 10 minutes grace period)
+        # 2. Delete files for closed workspaces (3600s = 1 hour grace period)
         for ws_id in list(workspaces.keys()):
-            if now - workspace_last_seen.get(ws_id, 0) > 600:
-                print(f"[!] Deleting workspace {ws_id}")
+            if now - workspace_last_seen.get(ws_id, 0) > 3600:
                 shutil.rmtree(workspaces[ws_id], ignore_errors=True)
                 del workspaces[ws_id]
                 if ws_id in workspace_last_seen: del workspace_last_seen[ws_id]
@@ -111,7 +107,6 @@ TERMINAL_HTML = """
 <body class="h-screen flex flex-col relative">
     <div class="stars"></div>
     
-    <!-- Top Bar -->
     <div class="glass px-4 md:px-6 py-4 rounded-b-3xl z-10 flex flex-wrap gap-2 justify-between items-center shadow-2xl border-t-0">
         <div class="flex items-center gap-3">
             <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
@@ -135,7 +130,6 @@ TERMINAL_HTML = """
         </div>
     </div>
 
-    <!-- Terminal -->
     <div class="flex-1 p-4 z-10">
         <div class="glass rounded-2xl h-full flex flex-col overflow-hidden shadow-[0_0_50px_rgba(79,70,229,0.1)] border-indigo-500/20">
             <div class="bg-gray-900/80 px-4 py-2 flex items-center justify-between border-b border-gray-800">
@@ -154,11 +148,7 @@ TERMINAL_HTML = """
                 <button onclick="closeFileManager()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
             </div>
             <div class="flex-1 flex overflow-hidden">
-                <!-- Sidebar (Files) -->
-                <div id="fileListDiv" class="w-1/3 border-r border-gray-700 overflow-y-auto p-2">
-                    <!-- Files load here -->
-                </div>
-                <!-- Editor -->
+                <div id="fileListDiv" class="w-1/3 border-r border-gray-700 overflow-y-auto p-2"></div>
                 <div class="w-2/3 flex flex-col">
                     <div id="editorHeader" class="p-2 border-b border-gray-700 text-sm text-gray-400 font-mono hidden">Select a file to edit</div>
                     <textarea id="codeEditor" class="flex-1 bg-transparent text-white font-mono text-sm p-4 focus:outline-none resize-none hidden"></textarea>
@@ -183,25 +173,25 @@ TERMINAL_HTML = """
         term.loadAddon(fitAddon);
         term.open(document.getElementById('terminal-container'));
         fitAddon.fit();
-        term.focus();
+
+        // Force keyboard on mobile
+        document.getElementById('terminal-container').addEventListener('touchstart', () => {
+            term.focus();
+        }, {passive: true});
 
         const socket = io();
-        let isConnected = false;
 
         socket.on('connect', () => {
-            isConnected = true;
             document.getElementById('statusText').innerText = "Connected";
             document.getElementById('statusText').className = "text-green-400";
             socket.emit('start_pty', { ws_id: ws_id });
             
-            // Send heartbeat every 10 seconds
             setInterval(() => { 
-                if(isConnected) socket.emit('heartbeat', { ws_id: ws_id }); 
+                socket.emit('heartbeat', { ws_id: ws_id }); 
             }, 10000);
         });
 
         socket.on('disconnect', () => {
-            isConnected = false;
             document.getElementById('statusText').innerText = "Disconnected";
             document.getElementById('statusText').className = "text-red-400";
         });
@@ -210,15 +200,14 @@ TERMINAL_HTML = """
         socket.on('upload_success', (filename) => { term.write(`\\r\\n\\x1b[1;32m[+] File ${filename} uploaded!\\x1b[0m\\r\\n`); });
         socket.on('upload_error', (err) => { term.write(`\\r\\n\\x1b[1;31m[!] Upload failed: ${err}\\x1b[0m\\r\\n`); });
 
-        term.onData((data) => { socket.emit('pty_input', data); });
+        // Send keystrokes with ws_id to ensure it goes to the right terminal
+        term.onData((data) => { socket.emit('pty_input', { ws_id: ws_id, data: data }); });
 
-        // --- CTRL+C ---
         function sendCtrlC() {
-            socket.emit('pty_input', '\\x03');
+            socket.emit('pty_input', { ws_id: ws_id, data: '\\x03' });
             term.focus();
         }
 
-        // --- UPLOAD ---
         function uploadFile() {
             const fileInput = document.getElementById('fileInput');
             const file = fileInput.files[0];
@@ -235,7 +224,6 @@ TERMINAL_HTML = """
             fileInput.value = ''; 
         }
 
-        // --- FILE MANAGER ---
         let currentFile = null;
 
         function openFileManager() {
@@ -274,11 +262,9 @@ TERMINAL_HTML = """
                     if (res.success) {
                         document.getElementById('editorHeader').innerText = "Editing: " + filename;
                         document.getElementById('editorHeader').classList.remove('hidden');
-                        
                         const editor = document.getElementById('codeEditor');
                         editor.value = res.content;
                         editor.classList.remove('hidden');
-                        
                         document.getElementById('editorFooter').classList.remove('hidden');
                     } else {
                         alert("Cannot open file: " + res.error);
@@ -345,12 +331,10 @@ def logout():
 @app.route('/')
 def index():
     if not session.get('logged_in'): return redirect(url_for('login'))
-    
     ws_id = session.get('ws_id')
     if ws_id not in workspaces:
         workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
     workspace_last_seen[ws_id] = time.time()
-    
     return render_template_string(TERMINAL_HTML)
 
 @app.route('/upload', methods=['POST'])
@@ -365,13 +349,11 @@ def upload():
     file.save(filepath)
     return jsonify({"success": True})
 
-# ─────────────────────── FILE MANAGER APIS ───────────────────
 @app.route('/api/files')
 def api_files():
     if not session.get('logged_in'): return jsonify([])
     ws_id = session.get('ws_id')
     if ws_id not in workspaces: return jsonify([])
-    
     path = workspaces[ws_id]
     files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
     return jsonify(files)
@@ -414,32 +396,18 @@ def api_delete():
 @socketio.on('start_pty')
 def start_pty(data):
     ws_id = data.get('ws_id')
+    # Join a dedicated room for this workspace so all inputs/outputs match
+    join_room(ws_id)
     
     if ws_id not in workspaces:
         workspaces[ws_id] = tempfile.mkdtemp(prefix=f"rexi_ws_")
     workspace = workspaces[ws_id]
     workspace_last_seen[ws_id] = time.time()
 
-    # If terminal already exists (e.g. user refreshed the page), just attach to it
     if ws_id in active_terminals:
-        sess = active_terminals[ws_id]
-        sess["last_ping"] = time.time()
-        # Re-bind the output reader to the new socket room
-        def read_existing_pty():
-            while ws_id in active_terminals:
-                try:
-                    r, _, _ = select.select([sess["fd"]], [], [], 0.1)
-                    if sess["fd"] in r:
-                        output = os.read(sess["fd"], 1024)
-                        if not output: break
-                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=request.sid)
-                except:
-                    break
-            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Session terminated.\x1b[0m\r\n', room=request.sid)
-        socketio.start_background_task(read_existing_pty)
+        active_terminals[ws_id]["last_ping"] = time.time()
         return
 
-    # Otherwise, create a new terminal
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(workspace)
@@ -461,19 +429,20 @@ def start_pty(data):
                     if fd in r:
                         output = os.read(fd, 1024)
                         if not output: break
-                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=request.sid)
+                        # Emit to the ws_id room
+                        socketio.emit('pty_output', output.decode('utf-8', errors='replace'), room=ws_id)
                 except:
                     break
             if ws_id in active_terminals:
                 del active_terminals[ws_id]
-            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Connection closed.\x1b[0m\r\n', room=request.sid)
+            socketio.emit('pty_output', '\r\n\x1b[1;31m[!] Connection closed.\x1b[0m\r\n', room=ws_id)
 
         socketio.start_background_task(read_pty)
 
 @socketio.on('pty_input')
-def on_pty_input(data):
-    # Find the ws_id associated with this socket request
-    ws_id = session.get('ws_id')
+def on_pty_input(payload):
+    ws_id = payload.get('ws_id')
+    data = payload.get('data')
     if ws_id in active_terminals:
         fd = active_terminals[ws_id]["fd"]
         try:
@@ -488,6 +457,14 @@ def on_heartbeat(data):
         workspace_last_seen[ws_id] = time.time()
         if ws_id in active_terminals:
             active_terminals[ws_id]["last_ping"] = time.time()
+
+@socketio.on('show_upload_success')
+def show_upload_success(filename):
+    emit('upload_success', filename, room=request.sid)
+
+@socketio.on('show_upload_error')
+def show_upload_error(error):
+    emit('upload_error', error, room=request.sid)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
