@@ -21,6 +21,7 @@ AUTOSTART_FILE = os.path.join(WORKSPACE_PATH, "autostart.json")
 LOG_FILE = os.path.join(WORKSPACE_PATH, "bot_logs.txt")
 
 active_terminal = None
+workspace_last_seen = time.time()
 autostart_processes = []
 backup_lock = threading.Lock()
 
@@ -38,7 +39,6 @@ def ensure_repo_exists():
         requests.post("https://api.github.com/user/repos", headers=headers, json={"name": REPO_NAME, "private": True})
 
 def force_backup():
-    """Pushes all files to GitHub instantly."""
     with backup_lock:
         if not GITHUB_TOKEN.startswith("ghp_"): return
         try:
@@ -57,17 +57,15 @@ def force_backup():
                 if filename in repo_files: data["sha"] = repo_files[filename]
                 github_api("PUT", f"contents/{filename}", data)
         except Exception as e:
-            print(f"[Backup Error] {e}")
+            pass
 
 def periodic_backup():
     while True:
-        time.sleep(15) # Backup every 15 seconds now
+        time.sleep(15)
         force_backup()
 
 def restore_workspace():
-    """Downloads files from GitHub on startup."""
     if not GITHUB_TOKEN.startswith("ghp_"): return
-    print("[+] Restoring files from GitHub...")
     try:
         res = github_api("GET", "contents/")
         if res.status_code == 200:
@@ -76,39 +74,29 @@ def restore_workspace():
                     dl = requests.get(item["download_url"])
                     with open(os.path.join(WORKSPACE_PATH, item["name"]), "wb") as f: 
                         f.write(dl.content)
-            print("[+] Files restored successfully!")
-        else:
-            print("[-] No files found on GitHub.")
     except Exception as e:
-        print(f"[Restore Error] {e}")
+        pass
 
 # ─────────────────── AUTO HOST SYSTEM ─────────────────────────
 def start_autostart_bots():
     global autostart_processes
     if not os.path.exists(AUTOSTART_FILE):
-        print("[-] No autostart.json found. Starting empty.")
         with open(AUTOSTART_FILE, "w") as f: json.dump([], f)
         return
-        
     try:
         with open(AUTOSTART_FILE, "r") as f: 
             cmds = json.load(f)
-            
-        print(f"[+] Found {len(cmds)} auto-host commands. Starting them now...")
         for cmd in cmds:
             with open(LOG_FILE, "a") as log:
                 log.write(f"\n\n--- [SYSTEM BOOT] Starting: {cmd} ---\n")
                 p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
                 autostart_processes.append({"cmd": cmd, "pid": p.pid})
     except Exception as e:
-        print(f"[Auto-start error] {e}")
+        pass
 
-# ─────────────────── BOOT SEQUENCE ────────────────────────────
 ensure_repo_exists()
-restore_workspace() # Restore synchronously so files exist before bots start
+restore_workspace()
 threading.Thread(target=periodic_backup, daemon=True).start()
-
-# Wait 10 seconds to ensure GitHub download finishes before starting bots
 threading.Timer(10.0, start_autostart_bots).start()
 
 # ─────────────────────── CLEANUP WATCHDOG ────────────────────
@@ -149,7 +137,6 @@ TERMINAL_HTML = """
 </head>
 <body class="h-screen flex flex-col p-2 relative bg-gray-900">
     
-    <!-- Top Bar -->
     <div class="bg-gray-800 border border-gray-700 px-4 py-3 rounded-lg flex flex-wrap gap-2 justify-between items-center shadow-lg mb-2">
         <div class="flex items-center gap-2">
             <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
@@ -158,14 +145,16 @@ TERMINAL_HTML = """
         <div class="flex flex-wrap gap-2">
             <button onclick="document.getElementById('fileInput').click()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded text-xs font-bold">📁 Upload</button>
             <input type="file" id="fileInput" class="hidden" onchange="uploadFile()">
-            
             <button onclick="openModal('fileManagerModal')" class="bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded text-xs font-bold">📝 Files</button>
             <button onclick="openModal('autoHostModal')" class="bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded text-xs font-bold">🚀 Auto-Host</button>
+            
+            <!-- NEW FORCE KILL BUTTON -->
+            <button onclick="forceKill()" class="bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded text-xs font-bold">💀 Force Kill</button>
+            
             <button onclick="sendCtrlC()" class="bg-yellow-600 hover:bg-yellow-500 text-black px-3 py-1.5 rounded text-xs font-bold">🛑 Ctrl+C</button>
         </div>
     </div>
 
-    <!-- Terminal -->
     <div id="terminal-container" onclick="term.focus()"></div>
 
     <!-- File Manager Modal -->
@@ -196,7 +185,7 @@ TERMINAL_HTML = """
                 <h2 class="text-lg font-bold text-green-400">🚀 Auto-Host Engine</h2>
             </div>
             <div class="p-4 flex gap-2 border-b border-gray-600 bg-gray-900">
-                <input type="text" id="hostCmd" placeholder="e.g. python ok.py" class="flex-1 bg-gray-800 border border-gray-600 rounded p-2 text-white text-sm focus:outline-none focus:border-green-500">
+                <input type="text" id="hostCmd" placeholder="e.g. python tg_bot.py" class="flex-1 bg-gray-800 border border-gray-600 rounded p-2 text-white text-sm focus:outline-none focus:border-green-500">
                 <button onclick="addAutoHost()" class="bg-green-600 hover:bg-green-500 text-white font-bold px-6 rounded text-sm">Add</button>
             </div>
             <div class="flex-1 flex overflow-hidden">
@@ -246,6 +235,15 @@ TERMINAL_HTML = """
         term.onData((data) => { socket.emit('pty_input', data); });
 
         function sendCtrlC() { socket.emit('pty_input', '\\x03'); term.focus(); }
+
+        function forceKill() {
+            if(!confirm("Force kill all Python processes? This will stop every running script.")) return;
+            fetch('/api/force_kill', {method: 'POST'})
+            .then(r => r.json())
+            .then(res => {
+                if(res.success) alert("All Python processes killed!");
+            });
+        }
 
         function openModal(id) {
             document.getElementById(id).classList.remove('hidden');
@@ -381,13 +379,19 @@ TERMINAL_HTML = """
 def index():
     return render_template_string(TERMINAL_HTML)
 
+@app.route('/api/force_kill', methods=['POST'])
+def api_force_kill():
+    # This runs completely outside the terminal, killing all python subprocesses
+    os.system("pkill -9 -f python")
+    return jsonify({"success": True})
+
 @app.route('/upload', methods=['POST'])
 def upload():
     file = request.files.get('file')
     if not file: return jsonify({"success": False, "error": "No file"})
     filepath = os.path.join(WORKSPACE_PATH, file.filename)
     file.save(filepath)
-    force_backup() # INSTANT BACKUP
+    force_backup()
     return jsonify({"success": True})
 
 @app.route('/api/files')
@@ -412,7 +416,7 @@ def api_save():
     try:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(data['content'])
-        force_backup() # INSTANT BACKUP
+        force_backup()
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
@@ -462,7 +466,7 @@ def api_autohost():
                 except: pass
         autostart_processes = [p for p in autostart_processes if p["cmd"] != cmd]
         
-    force_backup() # INSTANT BACKUP of autostart.json
+    force_backup()
     return jsonify({"success": True})
 
 @app.route('/api/logs')
