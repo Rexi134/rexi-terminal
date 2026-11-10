@@ -89,7 +89,10 @@ def start_autostart_bots():
         for cmd in cmds:
             with open(LOG_FILE, "a") as log:
                 log.write(f"\n\n--- [SYSTEM BOOT] Starting: {cmd} ---\n")
-                p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
+                # FORCE UNBUFFERED OUTPUT
+                env = os.environ.copy()
+                env["PYTHONUNBUFFERED"] = "1"
+                p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid, env=env)
                 autostart_processes.append({"cmd": cmd, "pid": p.pid})
     except Exception as e:
         pass
@@ -147,10 +150,7 @@ TERMINAL_HTML = """
             <input type="file" id="fileInput" class="hidden" onchange="uploadFile()">
             <button onclick="openModal('fileManagerModal')" class="bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded text-xs font-bold">📝 Files</button>
             <button onclick="openModal('autoHostModal')" class="bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded text-xs font-bold">🚀 Auto-Host</button>
-            
-            <!-- NEW FORCE KILL BUTTON -->
             <button onclick="forceKill()" class="bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded text-xs font-bold">💀 Force Kill</button>
-            
             <button onclick="sendCtrlC()" class="bg-yellow-600 hover:bg-yellow-500 text-black px-3 py-1.5 rounded text-xs font-bold">🛑 Ctrl+C</button>
         </div>
     </div>
@@ -185,7 +185,7 @@ TERMINAL_HTML = """
                 <h2 class="text-lg font-bold text-green-400">🚀 Auto-Host Engine</h2>
             </div>
             <div class="p-4 flex gap-2 border-b border-gray-600 bg-gray-900">
-                <input type="text" id="hostCmd" placeholder="e.g. python tg_bot.py" class="flex-1 bg-gray-800 border border-gray-600 rounded p-2 text-white text-sm focus:outline-none focus:border-green-500">
+                <input type="text" id="hostCmd" placeholder="e.g. python dsb.py" class="flex-1 bg-gray-800 border border-gray-600 rounded p-2 text-white text-sm focus:outline-none focus:border-green-500">
                 <button onclick="addAutoHost()" class="bg-green-600 hover:bg-green-500 text-white font-bold px-6 rounded text-sm">Add</button>
             </div>
             <div class="flex-1 flex overflow-hidden">
@@ -237,12 +237,8 @@ TERMINAL_HTML = """
         function sendCtrlC() { socket.emit('pty_input', '\\x03'); term.focus(); }
 
         function forceKill() {
-            if(!confirm("Force kill all Python processes? This will stop every running script.")) return;
-            fetch('/api/force_kill', {method: 'POST'})
-            .then(r => r.json())
-            .then(res => {
-                if(res.success) alert("All Python processes killed!");
-            });
+            if(!confirm("Force kill all Python processes?")) return;
+            fetch('/api/force_kill', {method: 'POST'}).then(r => r.json()).then(res => { if(res.success) alert("Killed!"); });
         }
 
         function openModal(id) {
@@ -292,7 +288,7 @@ TERMINAL_HTML = """
             if (!currentFile) return;
             const content = document.getElementById('codeEditor').value;
             fetch('/api/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({file: currentFile, content: content}) })
-            .then(r => r.json()).then(res => { if (res.success) alert("Saved and pushed to GitHub!"); else alert("Error: " + res.error); });
+            .then(r => r.json()).then(res => { if (res.success) alert("Saved!"); else alert("Error: " + res.error); });
         }
 
         function deleteFile(filename) {
@@ -368,7 +364,7 @@ TERMINAL_HTML = """
                     logBox.scrollTop = logBox.scrollHeight;
                 });
             }
-        }, 3000);
+        }, 2000); // Refresh faster
     </script>
 </body>
 </html>
@@ -381,7 +377,6 @@ def index():
 
 @app.route('/api/force_kill', methods=['POST'])
 def api_force_kill():
-    # This runs completely outside the terminal, killing all python subprocesses
     os.system("pkill -9 -f python")
     return jsonify({"success": True})
 
@@ -453,7 +448,9 @@ def api_autohost():
         
         with open(LOG_FILE, "a") as log:
             log.write(f"\n\n--- [MANUAL] Starting: {cmd} ---\n")
-            p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1" # Force instant logs
+            p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid, env=env)
             autostart_processes.append({"cmd": cmd, "pid": p.pid})
             
     elif action == 'remove' and cmd in cmds:
