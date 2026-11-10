@@ -87,12 +87,10 @@ def start_autostart_bots():
         with open(AUTOSTART_FILE, "r") as f: 
             cmds = json.load(f)
         for cmd in cmds:
+            # REVERTED TO EXACTLY HOW IT WAS WORKING BEFORE
             with open(LOG_FILE, "a") as log:
                 log.write(f"\n\n--- [SYSTEM BOOT] Starting: {cmd} ---\n")
-                # FORCE UNBUFFERED OUTPUT
-                env = os.environ.copy()
-                env["PYTHONUNBUFFERED"] = "1"
-                p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid, env=env)
+                p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
                 autostart_processes.append({"cmd": cmd, "pid": p.pid})
     except Exception as e:
         pass
@@ -364,7 +362,7 @@ TERMINAL_HTML = """
                     logBox.scrollTop = logBox.scrollHeight;
                 });
             }
-        }, 2000); // Refresh faster
+        }, 2000); 
     </script>
 </body>
 </html>
@@ -446,11 +444,10 @@ def api_autohost():
         cmds.append(cmd)
         with open(AUTOSTART_FILE, 'w') as f: json.dump(cmds, f)
         
+        # REVERTED TO EXACTLY HOW IT WAS WORKING
         with open(LOG_FILE, "a") as log:
             log.write(f"\n\n--- [MANUAL] Starting: {cmd} ---\n")
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1" # Force instant logs
-            p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid, env=env)
+            p = subprocess.Popen(cmd, shell=True, cwd=WORKSPACE_PATH, stdout=log, stderr=log, preexec_fn=os.setsid)
             autostart_processes.append({"cmd": cmd, "pid": p.pid})
             
     elif action == 'remove' and cmd in cmds:
