@@ -1,4 +1,6 @@
 flask
 flask-socketio
 eventlet
-requests
+requestswebsocket-client
+discord.py
+python-telegram-bot
